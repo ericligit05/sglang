@@ -474,14 +474,18 @@ __device__ inline void dequant_fp8_scales<half2, host::kFE4M3fn.id()>(int q, hal
 
 template <>
 __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE4M3fn.id()>(int q, nv_bfloat162* frag_b) {
-  constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
-  constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
-  constexpr int MASK = 0x7F007F00;
-
-  // Extract and shift FP8 values to BF16 format
-  int Out1 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
-  q <<= 8;
-  int Out2 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
+  // Each byte is an NVFP4 block scale in the S0E5M3 form written by
+  // nvfp4_marlin_process_scales: the top byte of the fp16 value scale * 2^7
+  // (5-bit exponent with bias 15, 3-bit mantissa). Place it in the bf16
+  // exponent and mantissa fields and rebias the exponent by 127 - 15 = 112.
+  // This is exact for every E4M3 scale, including the subnormals below 2^-6,
+  // whose byte has a clear top exponent bit. A zero byte becomes 2^-15, and
+  // its product with an FP4 value (at most 6 * 2^-126 before the global scale)
+  // rounds to 0 in bf16, so zero scales still give zero weights.
+  constexpr uint32_t REBIAS = (112u << 7) * 0x00010001u;
+  const uint32_t u = static_cast<uint32_t>(q);
+  const uint32_t Out1 = ((u & 0xFF00FF00u) >> 4) + REBIAS;
+  const uint32_t Out2 = (((u << 8) & 0xFF00FF00u) >> 4) + REBIAS;
 
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);

@@ -96,5 +96,67 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 
 
+@pytest.mark.skipif(
+    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
+    reason="NVFP4 Marlin dense numeric test requires CUDA SM80, SM86, SM90 or SM120",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("small_only", [False, True])
+def test_nvfp4_marlin_dense_subnormal_block_scales(dtype, small_only):
+    # E4M3 subnormal block scales (below 2^-6) occur in tensors whose largest
+    # block scale is near 448, and in checkpoints exported with a global scale
+    # of 1, where every block scale is small. Both activation dtypes must
+    # decode every block scale exactly, and zero scales must give zero weights.
+    torch.manual_seed(0)
+    size_n, size_k, group_size = 256, 1024, 16
+    e2m1 = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
+    )
+    codes = torch.randint(0, 16, (size_n, size_k), dtype=torch.uint8)
+
+    # Zero, the seven E4M3 subnormals, the smallest normal value 2^-6 and 2^-4,
+    # cycled; without small_only, half of the output channels use 448.
+    small = torch.tensor(
+        [0.0] + [i * 2.0**-9 for i in range(1, 8)] + [2.0**-6, 2.0**-4]
+    )
+    n_groups = size_k // group_size
+    scales = small.repeat(size_n * n_groups // len(small) + 1)[: size_n * n_groups]
+    scales = scales.view(size_n, n_groups)
+    if not small_only:
+        scales[: size_n // 2] = 448.0
+    scales = scales.to(torch.float8_e4m3fn)
+    global_scale = 1.0 if small_only else 2.0**-6
+
+    layer = torch.nn.Module()
+    layer.quant_config = SimpleNamespace(group_size=group_size)
+    layer.output_size_per_partition = size_n
+    layer.input_size_per_partition = size_k
+    layer.params_dtype = dtype
+    layer.weight = torch.nn.Parameter(
+        (codes[:, 0::2] | (codes[:, 1::2] << 4)).cuda(), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(scales.cuda(), requires_grad=False)
+    layer.weight_global_scale = torch.nn.Parameter(
+        torch.tensor([global_scale], dtype=dtype, device="cuda"), requires_grad=False
+    )
+    prepare_nvfp4_layer_for_marlin(layer)
+
+    # Rows of the identity: the output is the dequantized weight, exactly.
+    output = apply_fp4_marlin_linear(
+        torch.eye(size_k, dtype=dtype, device="cuda"),
+        layer.weight,
+        layer.weight_scale,
+        layer.weight_global_scale,
+        layer.workspace,
+        size_n,
+        size_k,
+        use_fp32_reduce=True,
+    )
+    weight_ref = e2m1[codes.long()] * scales.float().repeat_interleave(group_size, 1)
+    torch.testing.assert_close(
+        output.float().cpu(), (weight_ref * global_scale).T, rtol=0, atol=0
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
