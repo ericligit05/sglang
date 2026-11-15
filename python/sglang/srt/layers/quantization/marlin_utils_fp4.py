@@ -44,6 +44,42 @@ def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     return marlin_scales[:, 1::2].contiguous()
 
 
+def nvfp4_marlin_scale_factor(
+    scales: torch.Tensor, per_expert: bool = False
+) -> torch.Tensor:
+    """Power-of-two factor that lifts NVFP4 block scales into the range the bf16
+    Marlin kernel decodes.
+
+    nvfp4_marlin_process_scales stores each block scale as the top byte of the
+    fp16 value scale * 2^7, and the bf16 kernel decodes that byte correctly only
+    when scale >= 2^-6. Smaller scales (E4M3 subnormals, common in checkpoints
+    exported with a global scale of 1) dequantize their blocks to 0. Multiplying
+    the block scales by 2^k and dividing the global scale by 2^k leaves every
+    weight unchanged (vllm-project/vllm#34577). k is the smallest shift that
+    lifts the smallest nonzero scale to 2^-6, capped so that the largest scale
+    stays at or below 448, the E4M3 maximum. Returns shape (E,) per expert, or
+    (1,) for the whole tensor.
+    """
+    s = scales.float()
+    s = s.reshape(s.shape[0], -1) if per_expert else s.reshape(1, -1)
+    if s.numel() == 0:
+        return torch.ones(s.shape[0], device=s.device)
+    positive = s > 0
+    smallest = torch.where(positive, s, torch.full_like(s, float("inf"))).amin(1)
+    largest = torch.where(positive, s, torch.zeros_like(s)).amax(1)
+    need = torch.ceil(torch.log2((2.0**-6) / smallest)).clamp(min=0)
+    room = torch.floor(torch.log2(448.0 / largest)).clamp(min=0)
+    k = torch.minimum(need, room)
+    k = torch.where(positive.any(1) & torch.isfinite(k), k, torch.zeros_like(k))
+    if bool((need > room).any()):
+        logger.warning_once(
+            "NVFP4 Marlin: some block scales below 2^-6 cannot be rescaled into "
+            "range (the largest block scale of the tensor is too close to 448); "
+            "with bf16 activations their blocks dequantize to 0."
+        )
+    return torch.exp2(k)
+
+
 def nvfp4_marlin_process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
     assert global_scale.dtype in [torch.half, torch.bfloat16]
     global_scale_shape = global_scale.shape
@@ -192,7 +228,15 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
 
+    # Only the bf16 kernel needs block scales >= 2^-6; fp16 decodes all of them.
+    scale_factor = (
+        nvfp4_marlin_scale_factor(layer.weight_scale)
+        if param_dtype == torch.bfloat16
+        else None
+    )
     weight_scale = layer.weight_scale.T.contiguous().to(param_dtype)
+    if scale_factor is not None:
+        weight_scale = weight_scale * scale_factor.to(param_dtype)
     weight_scale = marlin_permute_scales(
         s=weight_scale,
         size_k=padded_size_k,
@@ -204,6 +248,8 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     weight_global_scale = layer.weight_global_scale.to(param_dtype)
     weight_global_scale = nvfp4_marlin_process_global_scale(weight_global_scale)
+    if scale_factor is not None:
+        weight_global_scale = weight_global_scale / scale_factor.to(param_dtype)
     layer.weight_global_scale = torch.nn.Parameter(
         weight_global_scale, requires_grad=False
     )
@@ -596,8 +642,27 @@ def prepare_moe_nvfp4_layer_for_marlin(
     w13_size_n, w13_size_k = intermediate_size * num_shards, hidden_size
     w2_size_n, w2_size_k = hidden_size, intermediate_size
 
-    def _process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
-        return nvfp4_marlin_process_global_scale(global_scale.to(param_dtype))
+    # Only the bf16 kernel needs block scales >= 2^-6; fp16 decodes all of them.
+    # Each expert has its own global scale, so each gets its own factor.
+    w13_factor = w2_factor = None
+    if param_dtype == torch.bfloat16:
+        w13_factor = nvfp4_marlin_scale_factor(w13_scale, per_expert=True)
+        w2_factor = nvfp4_marlin_scale_factor(w2_scale, per_expert=True)
+        w13_scale = w13_scale.to(param_dtype) * w13_factor.to(param_dtype).view(
+            -1, 1, 1
+        )
+        w2_scale = w2_scale.to(param_dtype) * w2_factor.to(param_dtype).view(-1, 1, 1)
+
+    def _process_global_scale(
+        global_scale: torch.Tensor, factor: torch.Tensor | None
+    ) -> torch.Tensor:
+        global_scale = nvfp4_marlin_process_global_scale(global_scale.to(param_dtype))
+        if factor is not None:
+            factor = factor.to(param_dtype)
+            global_scale = global_scale / factor.view(
+                -1, *([1] * (global_scale.dim() - 1))
+            )
+        return global_scale
 
     def _permute_bias(bias: torch.Tensor | None) -> torch.Tensor | None:
         if bias is None:
@@ -646,10 +711,10 @@ def prepare_moe_nvfp4_layer_for_marlin(
         requires_grad=False,
     )
     layer.w13_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w13_global_scale), requires_grad=False
+        _process_global_scale(w13_global_scale, w13_factor), requires_grad=False
     )
     layer.w2_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w2_global_scale), requires_grad=False
+        _process_global_scale(w2_global_scale, w2_factor), requires_grad=False
     )
 
     if w13_bias is not None:
