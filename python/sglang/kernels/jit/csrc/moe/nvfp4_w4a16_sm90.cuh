@@ -2542,7 +2542,11 @@ constexpr int D2_TMAX = 4;                     // tokens
 constexpr int D2_RMAX = 256;                   // routes
 constexpr int D2_EMAX = 1024;
 constexpr int D2_RED = D2_CW * 64 * D2_TMAX * 4;  // bytes per hand-off buffer: [warp][64 rows][D2_TMAX]
-constexpr int D2_NBAR = 32;
+constexpr int D2_NBAR = 48;
+constexpr int D2_IBMAX = 8;  // intermediate row buffers at most
+// 16B loads in flight per lane when reading intermediate rows: one round covers a Muse row (I = 4096), because each
+// round trip waits behind the weight stream (about 2us on H100) and four rounds cost 8us.
+constexpr int D2_RL = 32;
 constexpr int D2_FIXED = 2 * D2_RED + D2_NBAR * 8 + (5 * D2_RMAX + D2_EMAX + 8) * 4;  // past the ring and B rows
 constexpr int D2_SMEM_MAX = 232448;
 
@@ -2555,13 +2559,16 @@ struct D2Args {
   const float* tw;  // null: y per route (zeros for other ranks' routes); else the weighted sum into out
   const float* gs13;
   const float* gs2;
-  __nv_bfloat16* inter;
+  unsigned long long* inter;  // [routes][I / 2] words (two BF16 values | epoch << 32), persistent, zero at first
   __nv_bfloat16* y;
   __nv_bfloat16* out;
-  int* state;  // [0] CTAs done, [32 (1 + slot)] GEMM1 items done
+  int* state;  // [0] CTAs done, [1] the last call's epoch, [32 (1 + slot)] the slot's GEMM1 items done (hint)
   float scale;
   int T, topk, E, H, I, RB1, RB2, C1, C2, nc1, nc2;
-  int ns, off_x, off_i, ibuf, off_fixed;  // ring stages; byte offsets of x rows, the two intermediate buffers, the rest
+  int ns, off_x, off_i, ibuf, nbuf, off_fixed;  // ring stages; x rows; nbuf intermediate row buffers of ibuf bytes; the rest
+  const uint8_t* w13raw;  // DEBUG (dbg 4096): contiguous 36KB copies instead of the row boxes, timing only
+  const uint8_t* w2raw;
+  int phase;  // 0: both GEMMs; 1: GEMM1 only; 2: GEMM2 only (launched dependent on a phase-1 grid)
   int dbg;                    // DEBUG: 1 no consumer math, 2 no readiness wait, 16 plain launch
   unsigned long long* trace;  // DEBUG: per CTA [entry, setup done, first issue, last stage full, end, waits]
 };
@@ -2573,6 +2580,23 @@ __device__ __forceinline__ void tma_4d_h(uint32_t dst, const CUtensorMap* map, i
       "%4, %5}], [%6], %7;" ::"r"(dst),
       "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(bar), "l"(pol)
       : "memory");
+}
+__device__ __forceinline__ int ld_relaxed_s32(const int* p) {
+  int v;
+  asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void red_relaxed_add(int* p, int v) {
+  asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+// 8-byte accesses are single-copy atomic, so a word's epoch and its two values are always seen together.
+__device__ __forceinline__ void st_relaxed_u64(unsigned long long* p, unsigned long long v) {
+  asm volatile("st.relaxed.gpu.global.b64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+__device__ __forceinline__ uint4 ld_relaxed_2u64(const unsigned long long* p) {
+  unsigned long long a, c;
+  asm volatile("ld.relaxed.gpu.global.v2.b64 {%0, %1}, [%2];" : "=l"(a), "=l"(c) : "l"(p) : "memory");
+  return make_uint4((uint32_t)a, (uint32_t)(a >> 32), (uint32_t)c, (uint32_t)(c >> 32));
 }
 __device__ __forceinline__ void red_release_add(int* p, int v) {
   asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
@@ -2622,14 +2646,14 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
   int* slot_r0 = slot_m + D2_RMAX;
   int* routes = slot_r0 + D2_RMAX;  // route indices by slot, increasing within a slot
   int* scnt = routes + D2_RMAX;     // per expert: route count, then slot
-  int* misc = scnt + D2_EMAX;       // [0] slots
+  int* misc = scnt + D2_EMAX;       // [0] slots, [1] this CTA's GEMM1 items released by its epilogue
   const uint32_t ring = (uint32_t)__cvta_generic_to_shared(dsm);
   const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
   const int NS = A.ns;
   // barriers: stage full [0, 8), stage free [8, 16), x rows [16], intermediate rows full [17, 19) / free [19, 21),
   // hand-off full [21, 23) / free [23, 25)
-  const uint32_t bfull = bar0, bempty = bar0 + 64, bx = bar0 + 128, bif = bar0 + 136, bie = bar0 + 152,
-                 brf = bar0 + 168, bre = bar0 + 184;
+  const uint32_t bfull = bar0, bempty = bar0 + 64, bx = bar0 + 128, brf = bar0 + 168, bre = bar0 + 184,
+                 bif = bar0 + 200, bie = bar0 + 264;
   const int R = A.T * A.topk, E = A.E;
   auto gtime = []() {
     uint64_t t;
@@ -2644,13 +2668,28 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
       mbar_init(bempty + 8 * s, D2_CW);
     }
     mbar_init(bx, 1);
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < A.nbuf; s++) {
       mbar_init(bif + 8 * s, 1);
       mbar_init(bie + 8 * s, D2_CW);
+    }
+    for (int s = 0; s < 2; s++) {
       mbar_init(brf + 8 * s, D2_CW);
       mbar_init(bre + 8 * s, 1);
     }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  if (warp == D2_CW + 1 && !(A.dbg & 8)) {
+    // Bring the tagged intermediate's sectors and the slot counts into L2 now, before the weight stream fills the
+    // memory queues: a later store or poll that misses L2 waits behind the stream (about 10us on H100), one that hits
+    // does not. Each CTA loads its share of the 32B sectors; the values are discarded.
+    const char* base = reinterpret_cast<const char*>(A.inter);
+    const int64_t sectors = (int64_t)R * A.I * 4 / 32;
+    int acc = 0;
+    for (int64_t o = (int64_t)b * 32 + lane; o < sectors; o += (int64_t)G * 32)
+      acc ^= ld_relaxed_s32(reinterpret_cast<const int*>(base + o * 32));
+    for (int s = b * 32 + lane; s < min(E, R); s += G * 32)
+      acc ^= ld_relaxed_s32(A.state + 32 * (1 + s));
+    if (acc == 0x7fffffff && lane == 0) A.state[3] = acc;  // keeps the loads (never true for tags and counts)
   }
   for (int i = tid; i < R; i += D2_THREADS)
     sids[i] = A.ids[i];
@@ -2685,6 +2724,7 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
         r0 += slot_m[s];
       }
       misc[0] = n;
+      misc[1] = 0;
     }
   }
   __syncthreads();
@@ -2700,7 +2740,9 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
   __syncthreads();
   const int n = misc[0];
   const int N1 = n * A.RB1 * 4, P2 = A.RB2 * 8;
-  const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0, n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0;
+  const int n1c = N1 > b && A.phase != 2 ? (N1 - 1 - b) / G + 1 : 0;
+  const int n2c = P2 > b && A.phase != 1 ? (P2 - 1 - b) / G + 1 : 0;
+  if (A.phase == 1 && tid == 0) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   const int k1 = (A.C1 + A.nc1 - 1) / A.nc1, k2 = (A.C2 + A.nc2 - 1) / A.nc2;
   const int nitems = n1c + n2c * n;
   // item it of this CTA: GEMM1 (it < n1c) or GEMM2 piece (it - n1c) / n, slot (it - n1c) % n
@@ -2713,7 +2755,13 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
       kind = 1, s = (it - n1c) % n, rb = j >> 3, hp = j & 7;
     }
   };
-  int* const ready = A.state + 32;  // one 128B line per slot: 132 CTAs poll them
+  // This call's epoch tags the intermediate words, so a GEMM2 reader needs no counter and the writer no fence (a
+  // gpu-scope fence waits behind the weight stream, about 10us on H100). The last CTA advances it at the end.
+  uint32_t ep = (uint32_t)A.state[1] + 1u;
+  if (ep == 0) ep = 1;
+  // Per slot, a relaxed count of its finished GEMM1 items (one 128B line each): only a hint that lets a reader poll
+  // one word instead of the rows; the tags alone decide when a word is read.
+  int* const hint = A.state + 32;
   if (A.trace && tid == 0) A.trace[b * 16 + 1] = gtime();
 
   if (warp == D2_CW) {  // producer
@@ -2730,7 +2778,12 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
           if (k >= NS) mbar_wait(bempty + 8 * st, ((k / NS) + 1) & 1);
           const uint32_t dst = ring + st * D2_STB, bar = bfull + 8 * st;
           if (A.trace && k == 0) A.trace[b * 16 + 2] = gtime();
-          if (kind == 0) {
+          if (A.dbg & 4096) {
+            const uint8_t* src = kind == 0 ? A.w13raw + ((((int64_t)e * A.RB1 + rb) * 4 + hp) * k1 + j) * 36864
+                                           : A.w2raw + ((((int64_t)e * A.RB2 + rb) * 8 + hp) * k2 + j) * 36864;
+            mbar_expect(bar, 36864);
+            bulk_g2s(dst, src, 36864, bar, pol);
+          } else if (kind == 0) {
             const int h = hp >> 1, p = hp & 1, row = e * A.RB1 + rb;
             mbar_expect(bar, 2 * 1152 * A.nc1);
             tma_4d_h(dst, &mp.w13, 0, 4 * h + p, j * A.nc1, row, bar, pol);
@@ -2743,32 +2796,55 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
       }
     }
   } else if (warp == D2_CW + 1) {  // the intermediate rows of each GEMM2 item, double-buffered
-    const int rowb = 2 * A.I + 16, per = A.I / 8;
-    for (int j2 = 0; j2 < n2c * n; j2++) {
-      const int s = j2 % n, buf = j2 & 1, m = slot_m[s], r0 = slot_r0[s];
-      if (j2 >= 2) mbar_wait(bie + 8 * buf, ((j2 >> 1) + 1) & 1);
-      if (A.trace && lane == 0 && j2 < 3) A.trace[b * 16 + 8 + 2 * j2] = gtime();
-      if (!(A.dbg & 2)) {
-        if (lane == 0)
-          while (ld_acquire(ready + 32 * s) < A.RB1 * 4)
-            __nanosleep(256);
-        __syncwarp();
+    const int rowb = 2 * A.I + 16, per = A.I / 4;  // 16B loads per row
+    for (int j2 = 0; j2 < ((A.dbg & 8192) ? 0 : n2c * n); j2++) {
+      const int s = j2 % n, buf = j2 % A.nbuf, m = slot_m[s], r0 = slot_r0[s];
+      if (j2 >= A.nbuf) mbar_wait(bie + 8 * buf, ((j2 / A.nbuf) + 1) & 1);
+      if (A.trace && lane == 0 && j2 < 2) A.trace[b * 16 + 8 + 2 * j2] = gtime();
+      // Poll only once this CTA's own GEMM1 items are out (132 CTAs spinning on one line from the start slow the
+      // counts they wait for), then with a short backoff.
+      if (A.dbg & 128) {
+      } else if (A.phase == 2) {
+        if (j2 == 0) GDC_WAIT();
+      } else if (lane == 0) {
+        if (j2 == 0 && !(A.dbg & 32))
+          while (*reinterpret_cast<volatile int*>(misc + 1) < n1c)
+            __nanosleep(64);
+        while (ld_relaxed_s32(hint + 32 * s) < A.RB1 * 4)
+          __nanosleep(A.dbg & 64 ? 1000 : 100);
       }
-      if (A.trace && lane == 0 && j2 < 3) A.trace[b * 16 + 9 + 2 * j2] = gtime();
+      if (A.trace && lane == 0 && j2 == 0) A.trace[b * 16 + 13] = gtime();
+      __syncwarp();
       uint8_t* bb = dsm + A.off_i + buf * A.ibuf;
-      for (int i0 = 0; i0 < m * per; i0 += 32 * 8) {
-        uint4 v[8];
+      // 16B loads of two tagged words (four BF16 values); a word written by an earlier call has an older epoch, so
+      // the warp reloads until every word of the rows carries this call's epoch.
+      for (int i0 = 0; i0 < m * per; i0 += 32 * D2_RL) {
+        uint4 v[D2_RL];
+        const unsigned long long* src[D2_RL];
 #pragma unroll
-        for (int u = 0; u < 8; u++) {
+        for (int u = 0; u < D2_RL; u++) {
           const int i = i0 + u * 32 + lane;
-          if (i < m * per) v[u] = ld_cg4(A.inter + (int64_t)routes[r0 + i / per] * A.I + (i % per) * 8);
+          src[u] = A.inter + (int64_t)routes[r0 + min(i, m * per - 1) / per] * (A.I / 2) + (min(i, m * per - 1) % per) * 2;
+          v[u] = ld_relaxed_2u64(src[u]);
+        }
+        bool fresh = false;
+        while (!fresh) {
+          fresh = true;
+#pragma unroll
+          for (int u = 0; u < D2_RL; u++)
+            if (v[u].y != ep || v[u].w != ep) {
+              fresh = false;
+              v[u] = ld_relaxed_2u64(src[u]);
+            }
+          if (A.dbg & 2) fresh = true;
         }
 #pragma unroll
-        for (int u = 0; u < 8; u++) {
+        for (int u = 0; u < D2_RL; u++) {
           const int i = i0 + u * 32 + lane;
-          if (i < m * per) *reinterpret_cast<uint4*>(bb + (i / per) * rowb + (i % per) * 16) = v[u];
+          if (i < m * per) *reinterpret_cast<uint2*>(bb + (i / per) * rowb + (i % per) * 8) = make_uint2(v[u].x, v[u].z);
         }
       }
+      if (A.trace && lane == 0 && j2 < 2) A.trace[b * 16 + 9 + 2 * j2] = gtime();
       __syncwarp();
       if (lane == 0) mbar_arrive(bif + 8 * buf);
     }
@@ -2777,11 +2853,12 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
 #pragma unroll
     for (int t = 0; t < D2_TMAX; t++)
       wsum[t] = 0.f;
-    for (int it = 0; it < nitems; it++) {
+    for (int it = 0; it < ((A.dbg & 16384) ? 0 : nitems); it++) {
       int kind, s, rb, hp;
       item(it, kind, s, rb, hp);
       const int hb = it & 1, e = slot_e[s], m = slot_m[s], r0 = slot_r0[s];
       mbar_wait(brf + 8 * hb, (it >> 1) & 1);
+      if (A.trace && lane == 0 && it == 0) A.trace[b * 16 + 12] = gtime();
       const float* red = redb + hb * (D2_RED / 4);
       const int jr = lane;
       if (kind == 0) {
@@ -2794,14 +2871,20 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
           for (int w = 0; w < D2_CW; w++)
             gt += red[(w * 64 + jr) * D2_TMAX + r], ut += red[(w * 64 + 32 + jr) * D2_TMAX + r];
           gt *= sc;
-          A.inter[(int64_t)routes[r0 + r] * A.I + col] = __float2bfloat16(gt / (1.f + __expf(-gt)) * (ut * sc));
+          // lanes 2c and 2c + 1 hold adjacent intermediate columns: one tagged 8-byte word per pair
+          const uint32_t hv = __bfloat16_as_ushort(__float2bfloat16(gt / (1.f + __expf(-gt)) * (ut * sc)));
+          const uint32_t hn = __shfl_down_sync(0xffffffffu, hv, 1);
+          if (!(lane & 1))
+            st_relaxed_u64(A.inter + (int64_t)routes[r0 + r] * (A.I / 2) + col / 2,
+                           ((unsigned long long)ep << 32) | (hv | (hn << 16)));
         }
         __syncwarp();
         if (lane == 0) {
           mbar_arrive(bre + 8 * hb);
-          asm volatile("fence.acq_rel.gpu;" ::: "memory");
-          red_release_add(ready + 32 * s, 1);
+          if (A.phase == 0) red_relaxed_add(hint + 32 * s, 1);
+          *reinterpret_cast<volatile int*>(misc + 1) = it + 1;
           if (A.trace) A.trace[b * 16 + 14] = gtime();
+          if (A.trace && it == 0) A.trace[b * 16 + 15] = gtime();
         }
       } else {
         const float sc = __ldg(A.gs2 + e) * 9.223372036854775808e18f;
@@ -2864,9 +2947,9 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
         if (g < m) brow = dsm + A.off_x + (routes[r0 + g] / A.topk) * rowx;
       } else {
         const uint64_t t0 = A.trace ? gtime() : 0;
-        mbar_wait(bif + 8 * (j2 & 1), (j2 >> 1) & 1);
+        if (!(A.dbg & 8192)) mbar_wait(bif + 8 * (j2 % A.nbuf), (j2 / A.nbuf) & 1);
         if (A.trace) wb_ += gtime() - t0;
-        if (g < m) brow = dsm + A.off_i + (j2 & 1) * A.ibuf + g * rowi;
+        if (g < m) brow = dsm + A.off_i + (j2 % A.nbuf) * A.ibuf + g * rowi;
       }
       float acc[4][4];
 #pragma unroll
@@ -2883,6 +2966,7 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
           if (A.trace) wf_ += gtime() - t0;
         }
         if (A.trace && tid == 0) A.trace[b * 16 + 3] = gtime();
+        if (A.trace && tid == 0 && k == 3) A.trace[b * 16 + 7] = gtime();
         const uint8_t* sb = dsm + st * D2_STB;
         const int nv = min(nc, C - j * nc);
         if (A.dbg & 1) {
@@ -2898,10 +2982,11 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
       }
       if (kind == 1) {
         __syncwarp();
-        if (lane == 0) mbar_arrive(bie + 8 * (j2 & 1));
+        if (lane == 0) mbar_arrive(bie + 8 * (j2 % A.nbuf));
       }
       // this warp's K share to the epilogue
       const int hb = it & 1;
+      if (A.dbg & 16384) continue;
       if (it >= 2) mbar_wait(bre + 8 * hb, ((it >> 1) + 1) & 1);
       float* red = redb + hb * (D2_RED / 4);
       const int U = kind ? 2 : 4;
@@ -2920,13 +3005,17 @@ __global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ 
   }
   __syncthreads();
   if (A.trace && tid == 0) A.trace[b * 16 + 4] = gtime();
-  // The last CTA to finish resets the readiness counters: every CTA is past its last wait on them.
+  // The last CTA to finish advances the epoch and resets the count.
   if (tid == 0) {
     __threadfence();
-    if (atom_add_acq_rel(A.state, 1) == G - 1) {
-      for (int s = 0; s < n; s++)
-        ready[32 * s] = 0;
-      A.state[0] = 0;
+    int* done = A.state + (A.phase == 1 ? 2 : 0);
+    if (atom_add_acq_rel(done, 1) == G - 1) {
+      if (A.phase != 1) {
+        for (int s = 0; s < n; s++)
+          hint[32 * s] = 0;
+        A.state[1] = (int)ep;
+      }
+      *done = 0;
     }
   }
 }
@@ -2958,7 +3047,6 @@ inline void run_decode2(
   auto H = SymbolicSize{"hidden"};
   auto K = SymbolicSize{"top_k"};
   auto R = SymbolicSize{"routes"};
-  auto I = SymbolicSize{"intermediate"};
   auto E = SymbolicSize{"local_experts"};
   auto device = SymbolicDevice{};
   TensorMatcher({T, H}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(x);
@@ -2966,13 +3054,16 @@ inline void run_decode2(
   TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs13);
   TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs2);
   TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(y);
-  TensorMatcher({R, I}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(inter);
+  TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).ensure_alignment(16).verify(inter);
   TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(state);
-  const int64_t t = T.unwrap(), h = H.unwrap(), topk = K.unwrap(), r = R.unwrap(), i = I.unwrap(), e = E.unwrap();
+  const int64_t t = T.unwrap(), h = H.unwrap(), topk = K.unwrap(), r = R.unwrap(), e = E.unwrap();
+  RuntimeCheck(w13.dim() == 5, "nvfp4_w4a16_sm90: packed w13 must be 5-D");
+  const int64_t i = w13.size(1) * 128;
   RuntimeCheck(r == t * topk, "nvfp4_w4a16_sm90: workspace rows ", r, " != tokens * top_k ", t * topk);
   RuntimeCheck(t >= 1 && t <= D2_TMAX && r <= D2_RMAX, "nvfp4_w4a16_sm90 decode2: at most ", D2_TMAX, " tokens and ",
                D2_RMAX, " routes");
-  const int64_t ns = dec2_ring_stages(t, h, i);
+  int64_t ns = dec2_ring_stages(t, h, i);
+  if (dbg & 0x700) ns = std::min<int64_t>(ns, (dbg >> 8) & 7);  // DEBUG: cap the ring
   RuntimeCheck(ns >= 2, "nvfp4_w4a16_sm90 decode2: tokens x width too large for shared memory");
   RuntimeCheck(h >= 256 && h % 256 == 0, "nvfp4_w4a16_sm90: hidden size must be a multiple of 256, got ", h);
   RuntimeCheck(i >= 128 && i % 128 == 0, "nvfp4_w4a16_sm90: intermediate size must be a multiple of 128, got ", i);
@@ -2989,6 +3080,7 @@ inline void run_decode2(
   RuntimeCheck(runtime::get_sm_version(dev.device_id) == 90, "nvfp4_w4a16_sm90: needs an sm_90 (Hopper) GPU");
   const int sms = (int)runtime::get_sm_count(dev.device_id);
   RuntimeCheck(state.size(0) >= 32 * (1 + std::min(e, r)), "nvfp4_w4a16_sm90 decode2: state too small");
+  RuntimeCheck(inter.size(0) >= r * i / 2, "nvfp4_w4a16_sm90 decode2: tagged intermediate too small");
   const int nc1 = std::min(16, C1), nc2 = std::min(32, C2);
   auto wmap = [&](void* base, int C, int64_t blocks, int nc) {
     return host::tma::make_map(
@@ -3008,7 +3100,7 @@ inline void run_decode2(
   A.tw = topk_weights.has_value() ? static_cast<const float*>(topk_weights.value().data_ptr()) : nullptr;
   A.gs13 = static_cast<const float*>(gs13.data_ptr());
   A.gs2 = static_cast<const float*>(gs2.data_ptr());
-  A.inter = static_cast<__nv_bfloat16*>(inter.data_ptr());
+  A.inter = static_cast<unsigned long long*>(inter.data_ptr());
   A.y = static_cast<__nv_bfloat16*>(y.data_ptr());
   A.out = out.has_value() ? static_cast<__nv_bfloat16*>(out.value().data_ptr()) : nullptr;
   A.state = static_cast<int*>(state.data_ptr());
@@ -3019,13 +3111,26 @@ inline void run_decode2(
   A.off_x = (int)ns * D2_STB;
   A.ibuf = (int)(((t * (2 * i + 16) + 127) / 128) * 128);
   A.off_i = A.off_x + (int)(((t * (2 * h + 16) + 127) / 128) * 128);
-  A.off_fixed = A.off_i + 2 * A.ibuf;
+  // as many intermediate row buffers as the ring leaves room for (each GEMM2 item's rows are fetched that many items
+  // ahead, and one fetch waits several us behind the weight stream)
+  A.nbuf = (int)std::min<int64_t>(D2_IBMAX, (D2_SMEM_MAX - D2_FIXED - A.off_i) / A.ibuf);
+  A.off_fixed = A.off_i + A.nbuf * A.ibuf;
   A.dbg = (int)(dbg & 0xffff);
+  A.w13raw = static_cast<const uint8_t*>(w13.data_ptr());
+  A.w2raw = static_cast<const uint8_t*>(w2.data_ptr());
   A.trace = reinterpret_cast<unsigned long long*>(dbg >> 16);
   const int smem = A.off_fixed + D2_FIXED;
   const int grid = ctas > 0 ? (int)std::min<int64_t>(ctas, sms) : sms;
   runtime::set_max_dynamic_smem_per_device<dec2_k>(dev, D2_SMEM_MAX);
-  LaunchKernel(grid, D2_THREADS, dev, smem).enable_cooperative(!(dbg & 16))(dec2_k, mp, A);
+  if (dbg & 0x800) {  // two launches: GEMM1, then GEMM2 dependent on it (its prologue and weights overlap the tail)
+    A.phase = 1;
+    LaunchKernel(grid, D2_THREADS, dev, smem)(dec2_k, mp, A);
+    A.phase = 2;
+    LaunchKernel(grid, D2_THREADS, dev, smem).enable_pdl(true)(dec2_k, mp, A);
+  } else {
+    A.phase = 0;
+    LaunchKernel(grid, D2_THREADS, dev, smem).enable_cooperative(!(dbg & 16))(dec2_k, mp, A);
+  }
 }
 
 }  // namespace sglang::nvfp4_w4a16_sm90

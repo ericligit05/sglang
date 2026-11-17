@@ -30,6 +30,7 @@ DECODE_MAX_TOKENS = 0
 _DECODE_BATCH_CHUNKS = 16 * 132
 # Per device and stream: the decode kernel's FP32 partial sums and its counters (zero between calls).
 _decode_ws: dict = {}
+_decode2_ws: dict = {}
 _DECODE_DEBUG: dict = {}  # DEBUG: trace pointer, dbg bits, thr
 
 
@@ -72,6 +73,19 @@ def _decode_workspace(dev: torch.device, floats: int, words: int):
     return ws[0], ws[1]
 
 
+def _decode2_workspace(dev: torch.device, words: int):
+    """dec2_k's counters (done count, epoch) and its epoch-tagged intermediate words for this device and stream. Both
+    persist across calls (the epoch tells this call's words from older ones), start at zero, and only grow; a larger
+    request keeps the old buffers alive for CUDA graphs captured with them."""
+    key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
+    ws = _decode2_ws.get(key)
+    if ws is None or ws[1].numel() < words:
+        words = max(words, 1 << 16 if ws is None else ws[1].numel())
+        ws = (torch.zeros(32 * 257, dtype=torch.int32, device=dev), torch.zeros(words, dtype=torch.int64, device=dev), ws)
+        _decode2_ws[key] = ws
+    return ws[0], ws[1]
+
+
 def _decode_sizes(T: int, R: int, E: int, H: int, I: int, sms: int):
     nmax = min(E, R)
     rb1, rb2 = 2 * I // 256, H // 256
@@ -102,8 +116,7 @@ def nvfp4_w4a16_sm90_moe(
     E, I = experts.gs13.shape[0], experts.intermediate
     dev = x.device
     if variant == "decode2":
-        _, state = _decode_workspace(dev, 0, 32 * (1 + min(E, R)))
-        inter = torch.empty((R, I), dtype=torch.bfloat16, device=dev)
+        state, tagged = _decode2_workspace(dev, R * I // 2)
         if topk_weights is None:
             y = out if out is not None else torch.empty((R, H), dtype=torch.bfloat16, device=dev)
             combined = None
@@ -111,7 +124,7 @@ def nvfp4_w4a16_sm90_moe(
             y = torch.empty((R, H), dtype=torch.bfloat16, device=dev)
             combined = out if out is not None else torch.empty((T, H), dtype=torch.bfloat16, device=dev)
         _module(debug_delay_ns).run_decode2(
-            x, topk_ids, experts.w13, experts.w2, experts.gs13, experts.gs2, inter, y, state, topk_weights,
+            x, topk_ids, experts.w13, experts.w2, experts.gs13, experts.gs2, tagged, y, state, topk_weights,
             combined, float(scale), ctas, _DECODE_DEBUG.get("dbg2", 0),
         )
         return y if combined is None else combined
