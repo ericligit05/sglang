@@ -2513,4 +2513,519 @@ inline void run_decode(
     go(std::integral_constant<decltype(&dec_k<2>), &dec_k<2>>{});
 }
 
+
+// ---- decode path 2 (dec2_k): row ownership over the full K, for one to a few tokens ----
+// At decode sizes the call costs the touched experts' weight bytes. dec2_k reads each byte once from every SM at once
+// and never splits a K sum across CTAs (the structure of gauravjain14's one-token muse_moe_w4a16 kernel, generalized
+// to runtime shapes and to this op's weight layout):
+//   * Every CTA computes the routing (slots: experts with local routes in increasing id, each slot's routes in route
+//     order). GEMM1 items are (slot, row block, half, pair): 32 gate rows and their 32 up rows over all of K, item i
+//     on CTA i % G, slot-major, so the first slots' intermediates are complete early. GEMM2 pieces are 32 output rows
+//     (row block, pair); piece j is on CTA j % G, which runs it for every slot in increasing expert id and sums the
+//     weighted routes itself, so the weighted sum needs no other CTA and no atomics.
+//   * Within a 9216B chunk (256 rows x 64 k) 32 rows are 1152 contiguous bytes, so a stage is one tensor copy of
+//     1152B x up to 32 chunks (stride 9216B, 36KB, GEMM2) or two of 1152B x 16 chunks (gate and up rows, GEMM1).
+//     Measured on H100 at 3 Muse experts, this streams within 4.5% of contiguous 36KB bulk copies.
+//   * Roles: warp D2_CW (producer) issues the copies into the ring and waits only for free stages. Warp D2_CW + 1
+//     stages every token's x row once, then each GEMM2 item's intermediate rows into one of two buffers once the
+//     slot's GEMM1 items are all counted. The D2_CW consumer warps split each stage along K (chunk c to warp c % 8),
+//     decode in registers and run mma.sync m16n8k16 with the slot's routes as the n8 columns, and at an item's end
+//     hand their sums to warp D2_CW + 2 (epilogue) through one of two buffers, so they never wait on an epilogue.
+//     The epilogue adds the eight K shares in warp order, then writes SwiGLU into the intermediate and counts the
+//     slot's item (release), or keeps each token's weighted sum of the piece in registers and writes it after the
+//     piece's last slot (or writes y per route).
+//   * Counters (slot readiness, CTAs done) return to zero at the end of every call; the launch is cooperative.
+constexpr int D2_CW = 8;                       // consumer warps
+constexpr int D2_THREADS = (D2_CW + 3) * 32;   // + producer, B loader, epilogue
+constexpr int D2_STB = 36864;                  // bytes per stage
+constexpr int D2_TMAX = 4;                     // tokens
+constexpr int D2_RMAX = 256;                   // routes
+constexpr int D2_EMAX = 1024;
+constexpr int D2_RED = D2_CW * 64 * D2_TMAX * 4;  // bytes per hand-off buffer: [warp][64 rows][D2_TMAX]
+constexpr int D2_NBAR = 32;
+constexpr int D2_FIXED = 2 * D2_RED + D2_NBAR * 8 + (5 * D2_RMAX + D2_EMAX + 8) * 4;  // past the ring and B rows
+constexpr int D2_SMEM_MAX = 232448;
+
+struct D2Maps {
+  CUtensorMap w13, w2;  // {144 x 8B, 8 pairs, C chunks, E x RB row blocks}, boxes of 1152B x nc chunks
+};
+struct D2Args {
+  const __nv_bfloat16* x;
+  const int* ids;
+  const float* tw;  // null: y per route (zeros for other ranks' routes); else the weighted sum into out
+  const float* gs13;
+  const float* gs2;
+  __nv_bfloat16* inter;
+  __nv_bfloat16* y;
+  __nv_bfloat16* out;
+  int* state;  // [0] CTAs done, [32 (1 + slot)] GEMM1 items done
+  float scale;
+  int T, topk, E, H, I, RB1, RB2, C1, C2, nc1, nc2;
+  int ns, off_x, off_i, ibuf, off_fixed;  // ring stages; byte offsets of x rows, the two intermediate buffers, the rest
+  int dbg;                    // DEBUG: 1 no consumer math, 2 no readiness wait, 16 plain launch
+  unsigned long long* trace;  // DEBUG: per CTA [entry, setup done, first issue, last stage full, end, waits]
+};
+
+__device__ __forceinline__ void tma_4d_h(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2, int c3,
+                                         uint32_t bar, uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3, "
+      "%4, %5}], [%6], %7;" ::"r"(dst),
+      "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(bar), "l"(pol)
+      : "memory");
+}
+__device__ __forceinline__ void red_release_add(int* p, int v) {
+  asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+// One stage of one item for this consumer warp: chunks w, w + 8, ... of the stage (< nv valid), U units of 16 rows
+// per chunk at byte offsets uoff[u]; brow is this lane's B row (column g), null for an empty column.
+template <int U>
+__device__ __forceinline__ void d2_stage(float (&acc)[4][4], const uint8_t* sb, const int (&uoff)[4], int nv,
+                                         const uint8_t* brow, int k0, int warp, int lane) {
+  const int q = lane & 3;
+  for (int c = warp; c < nv; c += D2_CW) {
+    uint4 b0 = make_uint4(0, 0, 0, 0), b1 = b0;
+    if (brow != nullptr) {
+      const uint8_t* bp = brow + (k0 + c) * 128 + q * 32;
+      b0 = *reinterpret_cast<const uint4*>(bp);
+      b1 = *reinterpret_cast<const uint4*>(bp + 16);
+    }
+    const uint8_t* cb = sb + c * 1152;
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+      const uint8_t* up = cb + uoff[u];
+      const uint4 nb = *reinterpret_cast<const uint4*>(up + lane * 16);
+      const uint32_t Sc = sc_bf16(*reinterpret_cast<const uint16_t*>(up + 512 + lane * 2), 0x4140);
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        uint32_t o[4];
+        decode4(u4w(nb, kk), o);
+        const uint32_t a0 = bmulh(o[0], Sc, 0), a1 = bmulh(o[1], Sc, 1), a2 = bmulh(o[2], Sc, 0),
+                       a3 = bmulh(o[3], Sc, 1);
+        const uint4& bv = kk < 2 ? b0 : b1;
+        mma16816(acc[u], a0, a1, a2, a3, u4w(bv, 2 * (kk & 1)), u4w(bv, 2 * (kk & 1) + 1));
+      }
+    }
+  }
+}
+
+__global__ void __launch_bounds__(D2_THREADS, 1) dec2_k(const __grid_constant__ D2Maps mp, const D2Args A) {
+  extern __shared__ __align__(1024) uint8_t dsm[];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, G = gridDim.x, b = blockIdx.x;
+  uint8_t* fx = dsm + A.off_fixed;
+  float* redb = reinterpret_cast<float*>(fx);  // two hand-off buffers
+  uint64_t* bars = reinterpret_cast<uint64_t*>(fx + 2 * D2_RED);
+  int* sids = reinterpret_cast<int*>(bars + D2_NBAR);
+  int* slot_e = sids + D2_RMAX;
+  int* slot_m = slot_e + D2_RMAX;
+  int* slot_r0 = slot_m + D2_RMAX;
+  int* routes = slot_r0 + D2_RMAX;  // route indices by slot, increasing within a slot
+  int* scnt = routes + D2_RMAX;     // per expert: route count, then slot
+  int* misc = scnt + D2_EMAX;       // [0] slots
+  const uint32_t ring = (uint32_t)__cvta_generic_to_shared(dsm);
+  const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
+  const int NS = A.ns;
+  // barriers: stage full [0, 8), stage free [8, 16), x rows [16], intermediate rows full [17, 19) / free [19, 21),
+  // hand-off full [21, 23) / free [23, 25)
+  const uint32_t bfull = bar0, bempty = bar0 + 64, bx = bar0 + 128, bif = bar0 + 136, bie = bar0 + 152,
+                 brf = bar0 + 168, bre = bar0 + 184;
+  const int R = A.T * A.topk, E = A.E;
+  auto gtime = []() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+  };
+  if (A.trace && tid == 0) A.trace[b * 16] = gtime();
+
+  if (tid == 0) {
+    for (int s = 0; s < NS; s++) {
+      mbar_init(bfull + 8 * s, 1);
+      mbar_init(bempty + 8 * s, D2_CW);
+    }
+    mbar_init(bx, 1);
+    for (int s = 0; s < 2; s++) {
+      mbar_init(bif + 8 * s, 1);
+      mbar_init(bie + 8 * s, D2_CW);
+      mbar_init(brf + 8 * s, D2_CW);
+      mbar_init(bre + 8 * s, 1);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < R; i += D2_THREADS)
+    sids[i] = A.ids[i];
+  for (int e = tid; e < E; e += D2_THREADS)
+    scnt[e] = 0;
+  __syncthreads();
+  if (tid == (D2_CW + 1) * 32) {  // every token's x row (padded by 16B) by bulk copies; it needs no routing
+    mbar_expect(bx, A.T * 2 * A.H);
+    for (int t = 0; t < A.T; t++)
+      bulk_g2s(ring + A.off_x + t * (2 * A.H + 16), A.x + (int64_t)t * A.H, 2 * A.H, bx, pol_evict_first());
+  }
+  for (int i = tid; i < R; i += D2_THREADS)
+    if ((unsigned)sids[i] < (unsigned)E) atomicAdd(&scnt[sids[i]], 1);
+  __syncthreads();
+  if (warp == 0) {  // slots in increasing expert id; scnt[e] becomes e's slot
+    int n = 0;
+    for (int e0 = 0; e0 < E; e0 += 32) {
+      const int e = e0 + lane, c = e < E ? scnt[e] : 0;
+      const uint32_t bal = __ballot_sync(0xffffffffu, c > 0);
+      if (c > 0) {
+        const int pos = n + __popc(bal & ((1u << lane) - 1));
+        slot_e[pos] = e;
+        slot_m[pos] = c;
+        scnt[e] = pos;
+      }
+      n += __popc(bal);
+    }
+    if (lane == 0) {
+      int r0 = 0;
+      for (int s = 0; s < n; s++) {
+        slot_r0[s] = r0;
+        r0 += slot_m[s];
+      }
+      misc[0] = n;
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < R; i += D2_THREADS) {
+    const int e = sids[i];
+    if ((unsigned)e < (unsigned)E) {
+      int rank = 0;
+      for (int j = 0; j < i; j++)
+        rank += sids[j] == e;
+      routes[slot_r0[scnt[e]] + rank] = i;
+    }
+  }
+  __syncthreads();
+  const int n = misc[0];
+  const int N1 = n * A.RB1 * 4, P2 = A.RB2 * 8;
+  const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0, n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0;
+  const int k1 = (A.C1 + A.nc1 - 1) / A.nc1, k2 = (A.C2 + A.nc2 - 1) / A.nc2;
+  const int nitems = n1c + n2c * n;
+  // item it of this CTA: GEMM1 (it < n1c) or GEMM2 piece (it - n1c) / n, slot (it - n1c) % n
+  auto item = [&](int it, int& kind, int& s, int& rb, int& hp) {
+    if (it < n1c) {
+      const int i = b + it * G, per = A.RB1 * 4;
+      kind = 0, s = i / per, rb = (i % per) >> 2, hp = i & 3;
+    } else {
+      const int j = b + ((it - n1c) / n) * G;
+      kind = 1, s = (it - n1c) % n, rb = j >> 3, hp = j & 7;
+    }
+  };
+  int* const ready = A.state + 32;  // one 128B line per slot: 132 CTAs poll them
+  if (A.trace && tid == 0) A.trace[b * 16 + 1] = gtime();
+
+  if (warp == D2_CW) {  // producer
+    if (lane == 0) {
+      const uint64_t pol = pol_evict_first();
+      int k = 0;
+      for (int it = 0; it < nitems; it++) {
+        int kind, s, rb, hp;
+        item(it, kind, s, rb, hp);
+        const int e = slot_e[s];
+        const int ks = kind ? k2 : k1;
+        for (int j = 0; j < ks; j++, k++) {
+          const int st = k % NS;
+          if (k >= NS) mbar_wait(bempty + 8 * st, ((k / NS) + 1) & 1);
+          const uint32_t dst = ring + st * D2_STB, bar = bfull + 8 * st;
+          if (A.trace && k == 0) A.trace[b * 16 + 2] = gtime();
+          if (kind == 0) {
+            const int h = hp >> 1, p = hp & 1, row = e * A.RB1 + rb;
+            mbar_expect(bar, 2 * 1152 * A.nc1);
+            tma_4d_h(dst, &mp.w13, 0, 4 * h + p, j * A.nc1, row, bar, pol);
+            tma_4d_h(dst + 1152 * A.nc1, &mp.w13, 0, 4 * h + 2 + p, j * A.nc1, row, bar, pol);
+          } else {
+            mbar_expect(bar, 1152 * A.nc2);
+            tma_4d_h(dst, &mp.w2, 0, hp, j * A.nc2, e * A.RB2 + rb, bar, pol);
+          }
+        }
+      }
+    }
+  } else if (warp == D2_CW + 1) {  // the intermediate rows of each GEMM2 item, double-buffered
+    const int rowb = 2 * A.I + 16, per = A.I / 8;
+    for (int j2 = 0; j2 < n2c * n; j2++) {
+      const int s = j2 % n, buf = j2 & 1, m = slot_m[s], r0 = slot_r0[s];
+      if (j2 >= 2) mbar_wait(bie + 8 * buf, ((j2 >> 1) + 1) & 1);
+      if (A.trace && lane == 0 && j2 < 3) A.trace[b * 16 + 8 + 2 * j2] = gtime();
+      if (!(A.dbg & 2)) {
+        if (lane == 0)
+          while (ld_acquire(ready + 32 * s) < A.RB1 * 4)
+            __nanosleep(256);
+        __syncwarp();
+      }
+      if (A.trace && lane == 0 && j2 < 3) A.trace[b * 16 + 9 + 2 * j2] = gtime();
+      uint8_t* bb = dsm + A.off_i + buf * A.ibuf;
+      for (int i0 = 0; i0 < m * per; i0 += 32 * 8) {
+        uint4 v[8];
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+          const int i = i0 + u * 32 + lane;
+          if (i < m * per) v[u] = ld_cg4(A.inter + (int64_t)routes[r0 + i / per] * A.I + (i % per) * 8);
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u++) {
+          const int i = i0 + u * 32 + lane;
+          if (i < m * per) *reinterpret_cast<uint4*>(bb + (i / per) * rowb + (i % per) * 16) = v[u];
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(bif + 8 * buf);
+    }
+  } else if (warp == D2_CW + 2) {  // epilogue
+    float wsum[D2_TMAX];
+#pragma unroll
+    for (int t = 0; t < D2_TMAX; t++)
+      wsum[t] = 0.f;
+    for (int it = 0; it < nitems; it++) {
+      int kind, s, rb, hp;
+      item(it, kind, s, rb, hp);
+      const int hb = it & 1, e = slot_e[s], m = slot_m[s], r0 = slot_r0[s];
+      mbar_wait(brf + 8 * hb, (it >> 1) & 1);
+      const float* red = redb + hb * (D2_RED / 4);
+      const int jr = lane;
+      if (kind == 0) {
+        const float sc = __ldg(A.gs13 + e) * 9.223372036854775808e18f;
+        const int h = hp >> 1, p = hp & 1;
+        const int col = 128 * rb + 64 * h + dec_kp(32 * p + jr);
+        for (int r = 0; r < m; r++) {
+          float gt = 0.f, ut = 0.f;
+#pragma unroll
+          for (int w = 0; w < D2_CW; w++)
+            gt += red[(w * 64 + jr) * D2_TMAX + r], ut += red[(w * 64 + 32 + jr) * D2_TMAX + r];
+          gt *= sc;
+          A.inter[(int64_t)routes[r0 + r] * A.I + col] = __float2bfloat16(gt / (1.f + __expf(-gt)) * (ut * sc));
+        }
+        __syncwarp();
+        if (lane == 0) {
+          mbar_arrive(bre + 8 * hb);
+          asm volatile("fence.acq_rel.gpu;" ::: "memory");
+          red_release_add(ready + 32 * s, 1);
+          if (A.trace) A.trace[b * 16 + 14] = gtime();
+        }
+      } else {
+        const float sc = __ldg(A.gs2 + e) * 9.223372036854775808e18f;
+        const int row0 = 256 * rb + 32 * hp;
+        for (int r = 0; r < m; r++) {
+          float v = 0.f;
+#pragma unroll
+          for (int w = 0; w < D2_CW; w++)
+            v += red[(w * 64 + jr) * D2_TMAX + r];
+          const int route = routes[r0 + r];
+          const __nv_bfloat16 yv = __float2bfloat16(v * sc);
+          if (A.tw == nullptr) {
+            A.y[(int64_t)route * A.H + row0 + jr] = yv;
+          } else {
+            const float c = __ldg(A.tw + route) * __bfloat162float(yv);
+            const int t = route / A.topk;
+#pragma unroll
+            for (int tt = 0; tt < D2_TMAX; tt++)
+              if (tt == t) wsum[tt] += c;
+          }
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bre + 8 * hb);
+        if (s == n - 1) {  // the piece's last slot: its rows of out (or the zeros of other ranks' routes in y)
+          if (A.tw != nullptr) {
+#pragma unroll
+            for (int t = 0; t < D2_TMAX; t++) {
+              if (t < A.T) A.out[(int64_t)t * A.H + row0 + jr] = __float2bfloat16(wsum[t] * A.scale);
+              wsum[t] = 0.f;
+            }
+          } else {
+            for (int r = 0; r < R; r++)
+              if ((unsigned)sids[r] >= (unsigned)E) A.y[(int64_t)r * A.H + row0 + jr] = __float2bfloat16(0.f);
+          }
+        }
+      }
+    }
+    if (n == 0) {  // no local routes: this CTA's pieces are zeros
+      for (int it = 0; it < n2c; it++) {
+        const int j = b + it * G, row0 = 256 * (j >> 3) + 32 * (j & 7);
+        const int rows = A.tw != nullptr ? A.T : R;
+        __nv_bfloat16* dst = A.tw != nullptr ? A.out : A.y;
+        for (int r = 0; r < rows; r++)
+          dst[(int64_t)r * A.H + row0 + lane] = __float2bfloat16(0.f);
+      }
+    }
+  } else {  // consumers
+    const int g = lane >> 2, q = lane & 3;
+    int k = 0;
+    uint64_t wb_ = 0, wf_ = 0;  // DEBUG: waits on B rows, on stages
+    const int rowx = 2 * A.H + 16, rowi = 2 * A.I + 16;
+    if (n1c > 0) mbar_wait(bx, 0);
+    for (int it = 0; it < nitems; it++) {
+      int kind, s, rb, hp;
+      item(it, kind, s, rb, hp);
+      const int m = slot_m[s], r0 = slot_r0[s], j2 = it - n1c;
+      const int C = kind ? A.C2 : A.C1, nc = kind ? A.nc2 : A.nc1;
+      const uint8_t* brow = nullptr;
+      if (kind == 0) {
+        if (g < m) brow = dsm + A.off_x + (routes[r0 + g] / A.topk) * rowx;
+      } else {
+        const uint64_t t0 = A.trace ? gtime() : 0;
+        mbar_wait(bif + 8 * (j2 & 1), (j2 >> 1) & 1);
+        if (A.trace) wb_ += gtime() - t0;
+        if (g < m) brow = dsm + A.off_i + (j2 & 1) * A.ibuf + g * rowi;
+      }
+      float acc[4][4];
+#pragma unroll
+      for (int u = 0; u < 4; u++)
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+          acc[u][i] = 0.f;
+      const int ks = kind ? k2 : k1;
+      for (int j = 0; j < ks; j++, k++) {
+        const int st = k % NS;
+        {
+          const uint64_t t0 = A.trace ? gtime() : 0;
+          mbar_wait(bfull + 8 * st, (k / NS) & 1);
+          if (A.trace) wf_ += gtime() - t0;
+        }
+        if (A.trace && tid == 0) A.trace[b * 16 + 3] = gtime();
+        const uint8_t* sb = dsm + st * D2_STB;
+        const int nv = min(nc, C - j * nc);
+        if (A.dbg & 1) {
+        } else if (kind == 0) {
+          const int uo[4] = {0, 576, 1152 * nc, 1152 * nc + 576};
+          d2_stage<4>(acc, sb, uo, nv, brow, j * nc, warp, lane);
+        } else {
+          const int uo[4] = {0, 576, 0, 0};
+          d2_stage<2>(acc, sb, uo, nv, brow, j * nc, warp, lane);
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bempty + 8 * st);
+      }
+      if (kind == 1) {
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bie + 8 * (j2 & 1));
+      }
+      // this warp's K share to the epilogue
+      const int hb = it & 1;
+      if (it >= 2) mbar_wait(bre + 8 * hb, ((it >> 1) + 1) & 1);
+      float* red = redb + hb * (D2_RED / 4);
+      const int U = kind ? 2 : 4;
+#pragma unroll
+      for (int u = 0; u < 4; u++) {
+        if (u < U) {
+          float* rp = red + (warp * 64 + 16 * u + g) * D2_TMAX;
+          if (2 * q < m) rp[2 * q] = acc[u][0], rp[8 * D2_TMAX + 2 * q] = acc[u][2];
+          if (2 * q + 1 < m) rp[2 * q + 1] = acc[u][1], rp[8 * D2_TMAX + 2 * q + 1] = acc[u][3];
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(brf + 8 * hb);
+    }
+    if (A.trace && tid == 0) A.trace[b * 16 + 5] = wb_, A.trace[b * 16 + 6] = wf_;
+  }
+  __syncthreads();
+  if (A.trace && tid == 0) A.trace[b * 16 + 4] = gtime();
+  // The last CTA to finish resets the readiness counters: every CTA is past its last wait on them.
+  if (tid == 0) {
+    __threadfence();
+    if (atom_add_acq_rel(A.state, 1) == G - 1) {
+      for (int s = 0; s < n; s++)
+        ready[32 * s] = 0;
+      A.state[0] = 0;
+    }
+  }
+}
+
+// The decode path 2: one dec2_k launch, at most D2_TMAX tokens and as many as fit in shared memory (the ring keeps at
+// least two stages). Same contract as run_decode. state (int32, at least 32 (1 + min(E, T top_k)) words, zero before the
+// first call) is left zero.
+inline int64_t dec2_ring_stages(int64_t t, int64_t h, int64_t i) {
+  const int64_t rows = ((t * (2 * h + 16) + 127) / 128 + 2 * ((t * (2 * i + 16) + 127) / 128)) * 128;
+  return std::min<int64_t>(5, (D2_SMEM_MAX - D2_FIXED - rows) / D2_STB);
+}
+inline void run_decode2(
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView w13,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView gs13,
+    tvm::ffi::TensorView gs2,
+    tvm::ffi::TensorView inter,
+    tvm::ffi::TensorView y,
+    tvm::ffi::TensorView state,
+    tvm::ffi::Optional<tvm::ffi::TensorView> topk_weights,
+    tvm::ffi::Optional<tvm::ffi::TensorView> out,
+    double scale,
+    int64_t ctas,
+    int64_t dbg) {
+  using namespace host;
+  auto T = SymbolicSize{"tokens"};
+  auto H = SymbolicSize{"hidden"};
+  auto K = SymbolicSize{"top_k"};
+  auto R = SymbolicSize{"routes"};
+  auto I = SymbolicSize{"intermediate"};
+  auto E = SymbolicSize{"local_experts"};
+  auto device = SymbolicDevice{};
+  TensorMatcher({T, H}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(x);
+  TensorMatcher({T, K}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs13);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs2);
+  TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(y);
+  TensorMatcher({R, I}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(inter);
+  TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(state);
+  const int64_t t = T.unwrap(), h = H.unwrap(), topk = K.unwrap(), r = R.unwrap(), i = I.unwrap(), e = E.unwrap();
+  RuntimeCheck(r == t * topk, "nvfp4_w4a16_sm90: workspace rows ", r, " != tokens * top_k ", t * topk);
+  RuntimeCheck(t >= 1 && t <= D2_TMAX && r <= D2_RMAX, "nvfp4_w4a16_sm90 decode2: at most ", D2_TMAX, " tokens and ",
+               D2_RMAX, " routes");
+  const int64_t ns = dec2_ring_stages(t, h, i);
+  RuntimeCheck(ns >= 2, "nvfp4_w4a16_sm90 decode2: tokens x width too large for shared memory");
+  RuntimeCheck(h >= 256 && h % 256 == 0, "nvfp4_w4a16_sm90: hidden size must be a multiple of 256, got ", h);
+  RuntimeCheck(i >= 128 && i % 128 == 0, "nvfp4_w4a16_sm90: intermediate size must be a multiple of 128, got ", i);
+  RuntimeCheck(e >= 1 && e <= D2_EMAX, "nvfp4_w4a16_sm90: 1 to 1024 local experts, got ", e);
+  const int RB1 = (int)(2 * i / 256), RB2 = (int)(h / 256), C1 = (int)(h / 64), C2 = (int)(i / 64);
+  TensorMatcher({e, RB1, C1, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w13);
+  TensorMatcher({e, RB2, C2, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2);
+  RuntimeCheck(out.has_value() == topk_weights.has_value(), "nvfp4_w4a16_sm90: out and topk_weights go together");
+  if (out.has_value()) {
+    TensorMatcher({T, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(out.value());
+    TensorMatcher({T, K}).with_dtype<float>().with_device(device).verify(topk_weights.value());
+  }
+  const DLDevice dev = device.unwrap();
+  RuntimeCheck(runtime::get_sm_version(dev.device_id) == 90, "nvfp4_w4a16_sm90: needs an sm_90 (Hopper) GPU");
+  const int sms = (int)runtime::get_sm_count(dev.device_id);
+  RuntimeCheck(state.size(0) >= 32 * (1 + std::min(e, r)), "nvfp4_w4a16_sm90 decode2: state too small");
+  const int nc1 = std::min(16, C1), nc2 = std::min(32, C2);
+  auto wmap = [&](void* base, int C, int64_t blocks, int nc) {
+    return host::tma::make_map(
+        base,
+        CU_TENSOR_MAP_DATA_TYPE_UINT64,
+        {144, 8, (cuuint64_t)C, (cuuint64_t)blocks},
+        {1152, 9216, (cuuint64_t)C * 9216},
+        {144, 1, (cuuint32_t)nc, 1},
+        {.l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_256B});
+  };
+  D2Maps mp;
+  mp.w13 = wmap(w13.data_ptr(), C1, e * RB1, nc1);
+  mp.w2 = wmap(w2.data_ptr(), C2, e * RB2, nc2);
+  D2Args A;
+  A.x = static_cast<const __nv_bfloat16*>(x.data_ptr());
+  A.ids = static_cast<const int*>(topk_ids.data_ptr());
+  A.tw = topk_weights.has_value() ? static_cast<const float*>(topk_weights.value().data_ptr()) : nullptr;
+  A.gs13 = static_cast<const float*>(gs13.data_ptr());
+  A.gs2 = static_cast<const float*>(gs2.data_ptr());
+  A.inter = static_cast<__nv_bfloat16*>(inter.data_ptr());
+  A.y = static_cast<__nv_bfloat16*>(y.data_ptr());
+  A.out = out.has_value() ? static_cast<__nv_bfloat16*>(out.value().data_ptr()) : nullptr;
+  A.state = static_cast<int*>(state.data_ptr());
+  A.scale = (float)scale;
+  A.T = (int)t, A.topk = (int)topk, A.E = (int)e, A.H = (int)h, A.I = (int)i;
+  A.RB1 = RB1, A.RB2 = RB2, A.C1 = C1, A.C2 = C2, A.nc1 = nc1, A.nc2 = nc2;
+  A.ns = (int)ns;
+  A.off_x = (int)ns * D2_STB;
+  A.ibuf = (int)(((t * (2 * i + 16) + 127) / 128) * 128);
+  A.off_i = A.off_x + (int)(((t * (2 * h + 16) + 127) / 128) * 128);
+  A.off_fixed = A.off_i + 2 * A.ibuf;
+  A.dbg = (int)(dbg & 0xffff);
+  A.trace = reinterpret_cast<unsigned long long*>(dbg >> 16);
+  const int smem = A.off_fixed + D2_FIXED;
+  const int grid = ctas > 0 ? (int)std::min<int64_t>(ctas, sms) : sms;
+  runtime::set_max_dynamic_smem_per_device<dec2_k>(dev, D2_SMEM_MAX);
+  LaunchKernel(grid, D2_THREADS, dev, smem).enable_cooperative(!(dbg & 16))(dec2_k, mp, A);
+}
+
 }  // namespace sglang::nvfp4_w4a16_sm90

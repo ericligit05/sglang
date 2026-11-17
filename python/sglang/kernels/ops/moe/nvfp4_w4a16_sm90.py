@@ -45,6 +45,7 @@ def _module(debug_delay_ns: int = 0) -> Module:
         cuda_wrappers=[
             ("run", "nvfp4_w4a16_sm90::run"),
             ("run_decode", "nvfp4_w4a16_sm90::run_decode"),
+            ("run_decode2", "nvfp4_w4a16_sm90::run_decode2"),
         ],
         extra_cuda_cflags=[f"-DNVFP4_MOE_DEBUG_DELAY_NS={debug_delay_ns}"]
         if debug_delay_ns
@@ -100,6 +101,20 @@ def nvfp4_w4a16_sm90_moe(
     R = T * topk_ids.shape[1]
     E, I = experts.gs13.shape[0], experts.intermediate
     dev = x.device
+    if variant == "decode2":
+        _, state = _decode_workspace(dev, 0, 32 * (1 + min(E, R)))
+        inter = torch.empty((R, I), dtype=torch.bfloat16, device=dev)
+        if topk_weights is None:
+            y = out if out is not None else torch.empty((R, H), dtype=torch.bfloat16, device=dev)
+            combined = None
+        else:
+            y = torch.empty((R, H), dtype=torch.bfloat16, device=dev)
+            combined = out if out is not None else torch.empty((T, H), dtype=torch.bfloat16, device=dev)
+        _module(debug_delay_ns).run_decode2(
+            x, topk_ids, experts.w13, experts.w2, experts.gs13, experts.gs2, inter, y, state, topk_weights,
+            combined, float(scale), ctas, _DECODE_DEBUG.get("dbg2", 0),
+        )
+        return y if combined is None else combined
     if variant == "decode" or (
         variant == "auto" and 0 < T <= DECODE_MAX_TOKENS and R <= 256 and E <= 1024
     ):
