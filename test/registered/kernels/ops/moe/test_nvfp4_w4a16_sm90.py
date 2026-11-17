@@ -416,3 +416,132 @@ def test_progress_while_another_kernel_holds_sms(variant):
     assert finished, "no progress on the 16 free SMs within 10s"
     ref, local = _reference(ck, x, ids, E)
     _assert_close(y, ref, local)
+
+
+# ---- the one-launch decode kernel (variant "decode") ----
+
+
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 8, 9, 15, 16])
+@pytest.mark.parametrize("shape", ["deepseek_ep8", "qwen3_30b"])
+def test_decode_token_counts(shape, T):
+    """Every token count the decode kernel accepts (1 to 16), across both n8-block widths. Fails on: a K split
+    whose pieces miss or repeat a chunk (one chunk of 112 is 9% of a route), a piece's partial sums read from another
+    CTA's slot, a token beyond the first n8 block dropped, the H and I strides swapped (DeepSeek), a GEMM2 chunk that
+    reads an intermediate row block before its flag (Qwen3-30B's 12 chunks per row block span six flags)."""
+    _check(shape, T, variant="decode")
+
+
+@pytest.mark.parametrize(
+    "kind,remote",
+    [
+        ("hot", "minus_one"),
+        ("empty", "minus_one"),
+        ("remote", "minus_one"),
+        ("skew", "global"),
+    ],
+)
+def test_decode_routing_kinds(kind, remote):
+    """One expert taking half of the tokens (9 routes on one expert at 16 tokens), empty experts, no local route at
+    all, other ranks' routes as global ids. Fails on: an expert slot table that miscounts routes, a hang when no
+    expert is local (no piece anywhere), a global id read as local."""
+    for T in (1, 4, 16):
+        _check("deepseek_ep8", T, kind=kind, remote=remote, variant="decode")
+
+
+@pytest.mark.parametrize("case", ["subnormal", "small", "gateup"])
+def test_decode_scale_cases(case):
+    """The decode kernel with subnormal block scales, global scale 1 and differing gate and up scales. Fails on: a
+    finisher that applies GEMM1's global scale to GEMM2 or drops the folded up / gate factor."""
+    for T in (1, 9):
+        _check("deepseek_ep8", T, case=case, variant="decode")
+
+
+@pytest.mark.parametrize("shape", ["qwen3_next_ep8", "eplb36"])
+def test_decode_other_shapes(shape):
+    """Top 10 and 36 local experts on the decode kernel. Fails on: top 8 hard-coded in the routing or the weighted
+    sum, a batch split that drops the last expert when the experts do not divide evenly."""
+    for T in (1, 7, 16):
+        _check(shape, T, variant="decode")
+
+
+def test_decode_weighted_sum_and_repeat():
+    """The fused weighted sum against the reference, a token without a local route (its row must be zeros), then the
+    same call repeated: the output must be bitwise identical every time. Fails on: a combine that misses a route or
+    runs before a route's rows exist, a counter not returned to zero (the next call hangs or finishes early), a
+    reduction whose order depends on timing."""
+    H, I, E, Eg, topk = SHAPES["deepseek_ep8"]
+    ck, experts = _layer("deepseek_ep8")
+    for T in (1, 3, 16):
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=5 + T)
+        if T > 1:  # a token with no local route (at one token the sum would be all zeros)
+            ids[T // 2] = -1
+        w = torch.rand((T, topk), device="cuda")
+        ref, local = _reference(ck, x, ids, E)
+        ref_sum = (
+            ref.view(T, topk, H) * (w * local.view(T, topk)).unsqueeze(-1)
+        ).sum(1) * 2.5
+        out = torch.full((T, H), SENTINEL, dtype=torch.bfloat16, device="cuda")
+        nvfp4_w4a16_sm90_moe(
+            x, ids, experts, topk_weights=w, out=out, scale=2.5, variant="decode"
+        )
+        _assert_close(out, ref_sum, slice(None))
+        if T > 1:
+            assert bool((out[T // 2] == 0).all()), "a token without a local route is not zero"
+        for _ in range(5):
+            again = nvfp4_w4a16_sm90_moe(
+                x, ids, experts, topk_weights=w, scale=2.5, variant="decode"
+            )
+            assert torch.equal(again, out)
+
+
+def test_decode_cuda_graph_capture_and_reload():
+    """Capture the decode kernel at 1 and 4 tokens, replay with fresh routings, then repack new weights into the
+    same buffers and replay again. Fails on: a host-side routing decision (replay reuses the captured routing),
+    workspace or counters outside what the graph captured, a reload the captured kernel does not see."""
+    H, I, E, Eg, topk = SHAPES["deepseek_ep8"]
+    ck1, ck2 = _checkpoint(E, H, I, "normal", 21), _checkpoint(E, H, I, "gateup", 22)
+    experts = repack_modelopt_nvfp4_moe_for_sm90(**ck1)
+    for T in (1, 4):
+        repack_modelopt_nvfp4_moe_for_sm90(**ck1, out=experts)  # undo the previous count's reload
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=1)
+        w = torch.rand((T, topk), device="cuda")
+        out = torch.empty((T, H), dtype=torch.bfloat16, device="cuda")
+        nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, out=out, variant="decode")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, out=out, variant="decode")
+        for rep, (kind, ck) in enumerate((("skew", ck1), ("empty", ck1), ("skew", ck2))):
+            if rep == 2:
+                repack_modelopt_nvfp4_moe_for_sm90(**ck2, out=experts)
+            x.copy_(torch.randn((T, H), device="cuda").bfloat16())
+            ids.copy_(_routing(T, topk, E, Eg, kind=kind, seed=77 + rep))
+            graph.replay()
+            eager = nvfp4_w4a16_sm90_moe(
+                x, ids, experts, topk_weights=w, variant="decode"
+            )
+            torch.cuda.synchronize()
+            ref, local = _reference(ck, x, ids, E)
+            ref_sum = (
+                ref.view(T, topk, H) * (w * local.view(T, topk)).unsqueeze(-1)
+            ).sum(1)
+            _assert_close(out, ref_sum, slice(None))
+            assert torch.equal(out, eager)
+
+
+def test_decode_matches_grouped_kernel_and_refuses_too_many_tokens():
+    """The decode kernel agrees with the grouped kernel per route, and refuses more than 16 tokens. Fails on: a
+    decode result that drifts from the grouped kernel beyond BF16 rounding, a call past the kernel's two n8 blocks
+    of routes per expert."""
+    H, I, E, Eg, topk = SHAPES["qwen3_30b"]
+    ck, experts = _layer("qwen3_30b")
+    for T in (1, 4, 16):
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=9)
+        a = nvfp4_w4a16_sm90_moe(x, ids, experts, variant="decode").float()
+        b = nvfp4_w4a16_sm90_moe(x, ids, experts, variant="single").float()
+        assert float((a - b).norm() / b.norm()) < 0.01
+    x = torch.randn((17, H), device="cuda").bfloat16()
+    with pytest.raises(Exception):
+        nvfp4_w4a16_sm90_moe(x, _routing(17, topk, E, Eg), experts, variant="decode")

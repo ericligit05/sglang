@@ -1677,6 +1677,582 @@ __global__ void __launch_bounds__(256) combine_k(
   }
 }
 
+// ---- decode path (dec_k): the whole call in one launch for few tokens ----
+// At decode sizes the time is the selected experts' weight bytes, and grouped_k leaves most SMs idle behind its
+// routing kernels (3 experts x 48 row blocks at one token on the Muse shape). dec_k computes the routing in every CTA
+// (the ids are at most a few KB), then streams the weights from every SM at once:
+//   * Slots are the experts with local routes, in increasing id. Batches are runs of consecutive slots holding at
+//     least `thr` GEMM1 chunks in all (one expert per batch on large experts). Every CTA executes, in this order,
+//     GEMM1 of batch 0, GEMM1 of batch 1, GEMM2 of batch 0, GEMM1 of batch 2, GEMM2 of batch 1, ..., GEMM2 of the last
+//     batch, so a batch's GEMM2 starts one batch after its GEMM1 and never waits in steady state.
+//   * Each of those steps is one GEMM of one batch, its 9216B chunks (one 256-row block x 64 k, the pack's layout)
+//     flattened slot-major, row-block-major, chunk-minor and cut into one contiguous range per CTA. A range covers
+//     the tail of one row block and the head of the next ("pieces"), so the K sum of a row block is split over the
+//     CTAs whose ranges touch it.
+//   * Warp NW (producer) copies the CTA's chunks in that order into a ring of DEC_NS stages with 1D bulk copies and
+//     never waits for anything but a free stage: GEMM2's weights do not depend on GEMM1, so they land while GEMM1
+//     finishes. Warps 0 .. NW - 1 (consumers) decode units w and w + 8 of each chunk (decode4 and the narrow tiles'
+//     scale codes) and run mma.sync m16n8k16 with the slot's routes as n8 blocks; the B fragments are read straight
+//     from x (GEMM1) or the intermediate (GEMM2), whose natural column order is what the pack's K order expects.
+//     At a piece's end they write its FP32 partial sums and hand the piece to warp NW + 1 (finisher).
+//   * The finisher counts the piece on its row block. The CTA that counts a row block's last piece sums its pieces
+//     in CTA order (so the result never depends on timing), then: GEMM1 applies SiLU(gate) * up and writes 128
+//     columns of the intermediate, and raises the row block's ready flag; GEMM2 writes the BF16 output rows and, with
+//     the weighted sum, counts each route on its token, and the CTA that counts a token's last route writes
+//     scale * sum_k w[t, k] y[t top_k + k] (increasing k) for those 256 columns.
+//   * A GEMM2 chunk k reads intermediate columns [64 k, 64 k + 64), which one GEMM1 row block (k / 2) writes: the
+//     consumers wait for that flag only, just before loading the chunk's B fragments.
+// Every counter returns to zero by the end of the call (the last arriver resets a row block's or token's counter, and
+// the last CTA to finish resets the ready flags), so `state` must be zero before the first call and is then reused.
+// The launch is cooperative: all CTAs are resident, so a wait on another CTA's row block always ends.
+constexpr int DEC_SC = 4;     // chunks per ring stage: one bulk copy of up to 36KB (9KB copies stream at a third of the rate)
+constexpr int DEC_NS = 5;     // ring stages
+constexpr int DEC_PR = 32;    // piece hand-offs in flight from the consumers to the finisher
+constexpr int DEC_RMAX = 256; // routes (tokens x top_k)
+constexpr int DEC_TMAX = 16;  // tokens (at most two n8 blocks of one expert's routes)
+constexpr int DEC_EMAX = 1024;
+constexpr int DEC_PMAX = 384;  // pieces per CTA
+constexpr int DEC_BBUF = 16384;  // staged B rows
+constexpr int DEC_CW = 8;                     // consumer warps
+constexpr int DEC_FW = 4;                     // finisher warps (piece i goes to finisher i % DEC_FW)
+constexpr int DEC_UPW = 16 / DEC_CW;          // 16-row units per consumer warp per chunk
+constexpr int DEC_THREADS = (DEC_CW + 1 + DEC_FW) * 32;
+
+struct DecPiece {
+  int kind, slot, rb, c0, c1;  // GEMM (0, 1), slot, row block, chunks [c0, c1)
+  int poff;                    // this CTA's partial (floats into part)
+  int pfirst, pstride, np;     // the row block's first partial, the stride between its pieces' partials, its pieces
+  int key;                     // the row block's arrival counter in state
+};
+
+struct DecArgs {
+  const uint8_t* w13;
+  const uint8_t* w2;
+  const float* gs13;
+  const float* gs2;
+  const __nv_bfloat16* x;
+  const int* ids;
+  const float* tw;  // null: write y per route (zeros for other ranks' routes); else the weighted sum into out
+  __nv_bfloat16* inter;
+  __nv_bfloat16* y;
+  __nv_bfloat16* out;
+  float* part;
+  int* state;
+  float scale;
+  int T, topk, E, H, I, RB1, RB2, C1, C2, thr, nmax;
+  unsigned long long* trace;  // DEBUG
+  int dbg;                    // DEBUG
+};
+
+constexpr int DEC_SB = DEC_SC * WB2;
+constexpr int DEC_RING = DEC_NS * DEC_SB;
+constexpr int DEC_SMEM = DEC_RING + (2 * DEC_NS + 2 * DEC_PR) * 8 + (8 * DEC_RMAX + DEC_EMAX + DEC_TMAX + 8) * 4 +
+                         DEC_PMAX * (int)sizeof(DecPiece) + DEC_BBUF;
+
+// state: [0] CTAs finished | arrival counters (GEMM1 row blocks, then GEMM2's) | GEMM1 ready flags | token counters
+__host__ __device__ __forceinline__ int dec_rdy(int nmax, int rb1, int rb2) {
+  return 1 + nmax * (rb1 + rb2);
+}
+__host__ __device__ __forceinline__ int dec_tcnt(int nmax, int rb1, int rb2) {
+  return dec_rdy(nmax, rb1, rb2) + nmax * rb1;
+}
+
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, int bytes, uint32_t bar, uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;" ::
+          "r"(dst),
+      "l"(src),
+      "r"(bytes),
+      "r"(bar),
+      "l"(pol)
+      : "memory");
+}
+__device__ __forceinline__ uint4 ld_nc4(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ uint4 ld_cg4(const void* p) {
+  uint4 v;
+  asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ float4 ld_cg4f(const float* p) {
+  float4 v;
+  asm volatile("ld.global.cg.v4.f32 {%0,%1,%2,%3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p));
+  return v;
+}
+__device__ __forceinline__ void fence_acq_rel_gpu() {
+  asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+__device__ __forceinline__ int atom_add_acq_rel(int* p, int v) {
+  int o;
+  asm volatile("atom.add.acq_rel.gpu.global.s32 %0, [%1], %2;" : "=r"(o) : "l"(p), "r"(v) : "memory");
+  return o;
+}
+__device__ __forceinline__ void st_release(int* p, int v) {
+  asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ uint32_t u4w(const uint4& v, int i) {
+  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
+}
+// The CTA (of G) whose range [b W / G, (b + 1) W / G) holds unit u.
+__device__ __forceinline__ int dec_owner(int64_t u, int64_t W, int G) {
+  return (int)(((u + 1) * G + W - 1) / W) - 1;
+}
+// Natural intermediate column of gate row i (0 .. 63) of a 128-row half (pack.kperm_index).
+__device__ __forceinline__ int dec_kp(int i) {
+  return 16 * ((i >> 1) & 3) + 4 * (i >> 4) + 2 * ((i >> 3) & 1) + (i & 1);
+}
+
+template <int NT>
+__global__ void __launch_bounds__(DEC_THREADS, 1) dec_k(const DecArgs A) {
+  extern __shared__ __align__(1024) uint8_t dsm[];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, G = gridDim.x, b = blockIdx.x;
+  uint64_t* bars = reinterpret_cast<uint64_t*>(dsm + DEC_RING);
+  int* sids = reinterpret_cast<int*>(bars + 2 * DEC_NS + 2 * DEC_PR);  // the call's ids
+  int* slot_e = sids + DEC_RMAX;                                          // per slot: expert, routes, first route
+  int* slot_m = slot_e + DEC_RMAX;
+  int* slot_r0 = slot_m + DEC_RMAX;
+  int* routes = slot_r0 + DEC_RMAX;   // route indices by slot, increasing within a slot
+  int* scnt = routes + DEC_RMAX;      // per expert: route count, then slot
+  int* nloc = scnt + DEC_EMAX;        // per token: local routes
+  int* misc = nloc + DEC_TMAX;        // [0] slots, [1] pieces of this CTA, [2] batches
+  int* g2base = misc + 8;             // per batch: its GEMM2 step's first partial and partial stride
+  int* g2stride = g2base + DEC_RMAX;
+  int* rrank = g2stride + DEC_RMAX;   // per route: its position among its slot's routes
+  DecPiece* pieces = reinterpret_cast<DecPiece*>(rrank + DEC_RMAX);
+  uint8_t* bbuf = reinterpret_cast<uint8_t*>(pieces + DEC_PMAX);  // 16B aligned: 40B pieces x 384
+  const uint32_t ring = (uint32_t)__cvta_generic_to_shared(dsm);
+  const uint32_t bfull = (uint32_t)__cvta_generic_to_shared(bars), bempty = bfull + 8 * DEC_NS;
+  const uint32_t bpiece = bempty + 8 * DEC_NS, bpfree = bpiece + 8 * DEC_PR;
+  const int R = A.T * A.topk, E = A.E;
+  if (A.dbg & 64) return;  // DEBUG
+  if (A.trace && tid == 0) {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    A.trace[b * 16] = t;
+  }
+
+  if (tid == 0) {
+    for (int s = 0; s < DEC_NS; s++) {
+      mbar_init(bfull + 8 * s, 1);
+      mbar_init(bempty + 8 * s, DEC_CW);
+    }
+    for (int s = 0; s < DEC_PR; s++) {
+      mbar_init(bpiece + 8 * s, DEC_CW);
+      mbar_init(bpfree + 8 * s, 1);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < R; i += DEC_THREADS)
+    sids[i] = A.ids[i];
+  for (int e = tid; e < E; e += DEC_THREADS)
+    scnt[e] = 0;
+  __syncthreads();
+  for (int i = tid; i < R; i += DEC_THREADS)
+    if ((unsigned)sids[i] < (unsigned)E) atomicAdd(&scnt[sids[i]], 1);
+  __syncthreads();
+  if (warp == 0) {  // slots in increasing expert id; scnt[e] becomes e's slot
+    int n = 0;
+    for (int e0 = 0; e0 < E; e0 += 32) {
+      const int e = e0 + lane, c = e < E ? scnt[e] : 0;
+      const uint32_t bal = __ballot_sync(0xffffffffu, c > 0);
+      if (c > 0) {
+        const int pos = n + __popc(bal & ((1u << lane) - 1));
+        slot_e[pos] = e;
+        slot_m[pos] = c;
+        scnt[e] = pos;
+      }
+      n += __popc(bal);
+    }
+    if (lane == 0) {
+      int r0 = 0;
+      for (int s = 0; s < n; s++) {
+        slot_r0[s] = r0;
+        r0 += slot_m[s];
+      }
+      misc[0] = n;
+    }
+  }
+  __syncthreads();
+  const int n = misc[0];
+  for (int i = tid; i < R; i += DEC_THREADS) {
+    const int e = sids[i];
+    if ((unsigned)e < (unsigned)E) {
+      int rank = 0;
+      for (int j = 0; j < i; j++)
+        rank += sids[j] == e;
+      routes[slot_r0[scnt[e]] + rank] = i;
+      rrank[i] = rank;
+    }
+  }
+  for (int t = tid; t < A.T; t += DEC_THREADS) {
+    int c = 0;
+    for (int k = 0; k < A.topk; k++)
+      c += (unsigned)sids[t * A.topk + k] < (unsigned)E;
+    nloc[t] = c;
+  }
+  if (warp == 0) {  // this CTA's pieces, in execution order: one step per lane, offsets by warp scans
+    const int nb = n == 0 ? 0 : min(n, max(1, n * A.RB1 * A.C1 / A.thr));
+    int base = 0, np = 0;
+    for (int q0 = 0; q0 < 2 * nb; q0 += 32) {
+      const int q = q0 + lane;
+      int kind = 0, j = 0, s0 = 0, RB = 1, C = 1, mm = 0, ng = 0, cnt = 0, size = 0;
+      unsigned W = 1, lo = 0, hi = 0;
+      if (q < 2 * nb) {
+        if (q == 0) {
+          kind = 0, j = 0;
+        } else if (q == 2 * nb - 1) {
+          kind = 1, j = nb - 1;
+        } else {
+          kind = q & 1 ? 0 : 1;
+          j = q & 1 ? (q + 1) / 2 : (q + 1) / 2 - 1;
+        }
+        s0 = j * n / nb;
+        const int s1 = (j + 1) * n / nb;
+        RB = kind ? A.RB2 : A.RB1, C = kind ? A.C2 : A.C1;
+        for (int s = s0; s < s1; s++)
+          mm = max(mm, slot_m[s]);
+        W = (unsigned)((s1 - s0) * RB * C);
+        ng = (s1 - s0) * RB;
+        lo = (unsigned)b * W / (unsigned)G, hi = (unsigned)(b + 1) * W / (unsigned)G;
+        cnt = hi > lo ? (int)((hi - 1) / C - lo / C + 1) : 0;
+        size = (G + ng) * 256 * mm;
+      }
+      int sb = size, cb = cnt;  // inclusive scans
+#pragma unroll
+      for (int d = 1; d < 32; d <<= 1) {
+        const int a1 = __shfl_up_sync(0xffffffffu, sb, d), a2 = __shfl_up_sync(0xffffffffu, cb, d);
+        if (lane >= d) sb += a1, cb += a2;
+      }
+      int myb = base + sb - size, myp = np + cb - cnt;
+      if (kind == 1 && q < 2 * nb) g2base[j] = myb, g2stride[j] = 256 * mm;
+      const int stride = 256 * mm;
+      for (unsigned u = lo; u < hi;) {
+        const int gr = (int)(u / C);
+        const unsigned cend = min(hi, (unsigned)(gr + 1) * C);
+        const unsigned g0 = (unsigned)gr * C, g1 = (unsigned)(gr + 1) * C - 1;
+        const int bf = (int)(((g0 + 1) * G + W - 1) / W) - 1, bl = (int)(((g1 + 1) * G + W - 1) / W) - 1;
+        if (myp >= DEC_PMAX) __trap();
+        DecPiece& P = pieces[myp++];
+        P.kind = kind;
+        P.slot = s0 + gr / RB;
+        P.rb = gr % RB;
+        P.c0 = (int)(u - g0);
+        P.c1 = (int)(cend - g0);
+        P.poff = myb + (b + gr) * stride;
+        P.pfirst = myb + (bf + gr) * stride;
+        P.pstride = stride;
+        P.np = bl - bf + 1;
+        P.key = 1 + (kind ? A.nmax * A.RB1 + P.slot * A.RB2 : P.slot * A.RB1) + P.rb;
+        u = cend;
+      }
+      base += __shfl_sync(0xffffffffu, sb, 31);
+      np += __shfl_sync(0xffffffffu, cb, 31);
+    }
+    if (lane == 0) misc[1] = np, misc[2] = nb;
+  }
+  __syncthreads();
+  const int npc = misc[1];
+  if (A.dbg & 512) return;  // DEBUG
+  auto gtime = []() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+  };
+  if (A.trace && tid == 0) A.trace[b * 16 + 1] = gtime(), A.trace[b * 16 + 7] = npc;
+  int* const rdy = A.state + dec_rdy(A.nmax, A.RB1, A.RB2);
+  int* const tcnt = A.state + dec_tcnt(A.nmax, A.RB1, A.RB2);
+
+  if (warp == DEC_CW) {  // producer
+    if (lane == 0) {
+      const uint64_t pol = pol_evict_first();
+      int k = 0;
+      for (int pi = 0; pi < npc; pi++) {
+        const DecPiece P = pieces[pi];
+        const int e = slot_e[P.slot];
+        const uint8_t* src = P.kind ? A.w2 + ((int64_t)e * A.RB2 + P.rb) * A.C2 * WB2
+                                    : A.w13 + ((int64_t)e * A.RB1 + P.rb) * A.C1 * WB2;
+        for (int c = P.c0; c < P.c1; c += DEC_SC, k++) {
+          const int st = k % DEC_NS, bytes = min(DEC_SC, P.c1 - c) * WB2;
+          if (k >= DEC_NS) mbar_wait(bempty + 8 * st, ((k / DEC_NS) + 1) & 1);
+          mbar_expect(bfull + 8 * st, bytes);
+          bulk_g2s(ring + st * DEC_SB, src + (int64_t)c * WB2, bytes, bfull + 8 * st, pol);
+        }
+      }
+      if (A.trace) A.trace[b * 16 + 6] = gtime();
+    }
+  } else if (warp < DEC_CW) {  // consumers
+    const int g = lane >> 2, q = lane & 3;
+    int k = 0;
+    uint64_t twait = 0, tflag = 0;
+    bool g2seen = false;
+    for (int pi = 0; pi < npc; pi++) {
+      if (A.trace && tid == 0 && pi < 6) A.trace[b * 16 + 10 + pi] = gtime();
+      const DecPiece P = pieces[pi];
+      const int m = slot_m[P.slot], r0 = slot_r0[P.slot];
+      const int* flags = rdy + P.slot * A.RB1;
+      float acc[DEC_UPW][NT][4];
+#pragma unroll
+      for (int u = 0; u < DEC_UPW; u++)
+#pragma unroll
+        for (int nn = 0; nn < NT; nn++)
+#pragma unroll
+          for (int i = 0; i < 4; i++)
+            acc[u][nn][i] = 0.f;
+      // The piece's B rows (x for GEMM1, the intermediate for GEMM2), m tokens x up to nsub chunks of 128B at a time,
+      // are staged in shared memory by all consumer threads in one round trip, so no chunk waits on an L2 load.
+      const int nsub = (DEC_BBUF / m - 16) / 128 / DEC_SC * DEC_SC, rowb = nsub * 128 + 16;
+      int sc0 = P.c0, sb0 = P.c0;  // next chunk to stage, first chunk of the staged rows
+      for (int cs = P.c0; cs < P.c1; cs += DEC_SC) {
+        if (cs == sc0) {
+          const int sc1 = min(P.c1, sc0 + nsub);
+          if (P.kind == 1 && !(A.dbg & 8)) {  // the GEMM1 row blocks these chunks read are written
+            const uint64_t tf0 = A.trace ? gtime() : 0;
+            if (A.trace && tid == 0 && !g2seen) g2seen = true, A.trace[b * 16 + 8] = tf0;
+            for (int f = (sc0 >> 1) + lane; f <= (sc1 - 1) >> 1; f += 32)
+              while (ld_acquire(flags + f) == 0)
+                __nanosleep(32);
+            if (A.trace) tflag += gtime() - tf0;
+          }
+          asm volatile("bar.sync 1, %0;" ::"n"(DEC_CW * 32) : "memory");  // every warp is done with the last rows
+          const int per = (sc1 - sc0) * 8;
+          for (int i = tid; i < m * per; i += DEC_CW * 32) {
+            const int tok = i / per, cj = (i % per) >> 3, w = i & 7, route = routes[r0 + tok];
+            const int64_t off = (int64_t)(sc0 + cj) * 64 + w * 8;
+            const uint4 v = P.kind == 0 ? ld_nc4(A.x + (int64_t)(route / A.topk) * A.H + off)
+                                        : __ldcg(reinterpret_cast<const uint4*>(A.inter + (int64_t)route * A.I + off));
+            *reinterpret_cast<uint4*>(bbuf + tok * rowb + cj * 128 + w * 16) = v;
+          }
+          asm volatile("bar.sync 1, %0;" ::"n"(DEC_CW * 32) : "memory");
+          sb0 = sc0;
+          sc0 = sc1;
+        }
+        const int st = k % DEC_NS;
+        {
+          const uint64_t tw0 = A.trace ? gtime() : 0;
+          mbar_wait(bfull + 8 * st, (k / DEC_NS) & 1);
+          if (A.trace) { const uint64_t t1 = gtime(); twait += t1 - tw0; if (tid == 0 && k == 0) A.trace[b * 16 + 9] = t1; }
+        }
+#pragma unroll
+        for (int j = 0; j < DEC_SC; j++) {
+          if (cs + j >= P.c1 || (A.dbg & 9)) continue;
+          uint4 bv[NT][2];
+          const int cj = cs + j - sb0;
+#pragma unroll
+          for (int nn = 0; nn < NT; nn++) {
+            const int tok = 8 * nn + g;
+            if (tok < m) {
+              const uint8_t* bp = bbuf + tok * rowb + cj * 128 + q * 32;
+              bv[nn][0] = *reinterpret_cast<const uint4*>(bp);
+              bv[nn][1] = *reinterpret_cast<const uint4*>(bp + 16);
+            } else {
+              bv[nn][0] = bv[nn][1] = make_uint4(0, 0, 0, 0);
+            }
+          }
+          const uint8_t* wb = dsm + st * DEC_SB + j * WB2;
+#pragma unroll
+          for (int u = 0; u < DEC_UPW; u++) {
+            const uint8_t* up = wb + (warp + DEC_CW * u) * UNIT2;
+            const uint4 nb = *reinterpret_cast<const uint4*>(up + lane * 16);
+            const uint32_t Sc = sc_bf16(*reinterpret_cast<const uint16_t*>(up + 512 + lane * 2), 0x4140);
+#pragma unroll
+            for (int kk = 0; kk < 4; kk++) {
+              uint32_t o[4];
+              decode4(u4w(nb, kk), o);
+              const uint32_t a0 = bmulh(o[0], Sc, 0), a1 = bmulh(o[1], Sc, 1), a2 = bmulh(o[2], Sc, 0),
+                             a3 = bmulh(o[3], Sc, 1);
+#pragma unroll
+              for (int nn = 0; nn < NT; nn++)
+                mma16816(acc[u][nn], a0, a1, a2, a3, u4w(bv[nn][kk >> 1], 2 * (kk & 1)),
+                         u4w(bv[nn][kk >> 1], 2 * (kk & 1) + 1));
+            }
+          }
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bempty + 8 * st);
+        k++;
+      }
+      const int ps = pi % DEC_PR;
+      if (pi >= DEC_PR) mbar_wait(bpfree + 8 * ps, ((pi / DEC_PR) + 1) & 1);
+      float* pp = A.part + P.poff;
+#pragma unroll
+      for (int u = 0; u < DEC_UPW; u++) {
+        const int row = 16 * (warp + DEC_CW * u) + g;
+#pragma unroll
+        for (int nn = 0; nn < NT; nn++) {
+          const int t0 = 8 * nn + 2 * q;
+          if (t0 < m) {
+            pp[t0 * 256 + row] = acc[u][nn][0];
+            pp[t0 * 256 + row + 8] = acc[u][nn][2];
+          }
+          if (t0 + 1 < m) {
+            pp[(t0 + 1) * 256 + row] = acc[u][nn][1];
+            pp[(t0 + 1) * 256 + row + 8] = acc[u][nn][3];
+          }
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(bpiece + 8 * ps);
+    }
+    if (A.trace && tid == 0) A.trace[b * 16 + 2] = gtime(), A.trace[b * 16 + 3] = twait, A.trace[b * 16 + 4] = tflag;
+  } else {  // finishers
+    const int fw = warp - DEC_CW - 1;
+    if (b == 0 && fw == 0) {  // rows nothing else writes: other ranks' routes of y, or tokens without local routes of out
+      if (A.tw == nullptr) {
+        for (int i = 0; i < R; i++)
+          if ((unsigned)sids[i] >= (unsigned)E)
+            for (int c = lane * 8; c < A.H; c += 256)
+              *reinterpret_cast<uint4*>(A.y + (int64_t)i * A.H + c) = make_uint4(0, 0, 0, 0);
+      } else {
+        for (int t = 0; t < A.T; t++)
+          if (nloc[t] == 0)
+            for (int c = lane * 8; c < A.H; c += 256)
+              *reinterpret_cast<uint4*>(A.out + (int64_t)t * A.H + c) = make_uint4(0, 0, 0, 0);
+      }
+    }
+    for (int pi = fw; pi < npc; pi += DEC_FW) {
+      const int ps = pi % DEC_PR;
+      mbar_wait(bpiece + 8 * ps, (pi / DEC_PR) & 1);
+      if (lane == 0) mbar_arrive(bpfree + 8 * ps);
+      if (A.dbg & 128) continue;  // DEBUG
+      const DecPiece P = pieces[pi];
+      if (P.kind == 1 && A.tw != nullptr) {
+        // GEMM2 with the weighted sum: count this piece's chunks on each of its routes' tokens for these 256 output
+        // columns; the CTA that completes all of a token's nloc[t] * C2 chunks sums that token's routes' pieces and
+        // writes its 256 columns of out. Tokens finish in different CTAs, so the sums run in parallel.
+        bool done = false;
+        if (lane < slot_m[P.slot]) {
+          const int t = routes[slot_r0[P.slot] + lane] / A.topk, add = P.c1 - P.c0;
+          int* tc = tcnt + t * A.RB2 + P.rb;
+          done = atom_add_acq_rel(tc, add) + add == nloc[t] * A.C2;
+          if (done) *tc = 0;
+        }
+        uint32_t mask = __ballot_sync(0xffffffffu, done);
+        const int nbt = misc[2];
+        while (mask) {
+          const int jt = __ffs(mask) - 1;
+          mask &= mask - 1;
+          const int t = routes[slot_r0[P.slot] + jt] / A.topk;
+          float a[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+          // Four routes at a time, their pieces' loads issued together (one L2 round trip per piece index, not
+          // per route), then added in route order.
+          for (int k0 = 0; k0 < A.topk; k0 += 4) {
+            const float* pp[4];
+            int np[4], strd[4];
+            float scl[4], wk[4], v[4][8];
+            int maxnp = 0;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              np[i] = 0, pp[i] = A.part, strd[i] = 0, scl[i] = 0.f, wk[i] = 0.f;
+#pragma unroll
+              for (int c = 0; c < 8; c++)
+                v[i][c] = 0.f;
+              const int r = t * A.topk + k0 + i, e = k0 + i < A.topk ? sids[r] : -1;
+              if ((unsigned)e < (unsigned)E) {
+                const int s = scnt[e], j = ((s + 1) * nbt + n - 1) / n - 1;
+                const int s0 = j * n / nbt, s1 = (j + 1) * n / nbt;
+                const unsigned W = (unsigned)((s1 - s0) * A.RB2 * A.C2);
+                const int gr = (s - s0) * A.RB2 + P.rb;
+                const unsigned g0 = (unsigned)gr * A.C2, g1 = g0 + A.C2 - 1;
+                const int bf = (int)(((g0 + 1) * G + W - 1) / W) - 1, bl = (int)(((g1 + 1) * G + W - 1) / W) - 1;
+                pp[i] = A.part + g2base[j] + (bf + gr) * g2stride[j] + rrank[r] * 256 + 8 * lane;
+                np[i] = bl - bf + 1, strd[i] = g2stride[j];
+                scl[i] = __ldg(A.gs2 + e) * 9.223372036854775808e18f, wk[i] = __ldg(A.tw + r);
+                maxnp = max(maxnp, np[i]);
+              }
+            }
+#pragma unroll 2
+            for (int q2 = 0; q2 < maxnp; q2++) {
+#pragma unroll
+              for (int i = 0; i < 4; i++) {
+                if (q2 < np[i]) {
+                  const float* f = pp[i] + q2 * strd[i];
+                  const float4 v0 = __ldcg(reinterpret_cast<const float4*>(f));
+                  const float4 v1 = __ldcg(reinterpret_cast<const float4*>(f + 4));
+                  v[i][0] += v0.x, v[i][1] += v0.y, v[i][2] += v0.z, v[i][3] += v0.w;
+                  v[i][4] += v1.x, v[i][5] += v1.y, v[i][6] += v1.z, v[i][7] += v1.w;
+                }
+              }
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+              if (np[i] > 0)
+#pragma unroll
+                for (int c = 0; c < 8; c++)
+                  a[c] = fmaf(wk[i], __bfloat162float(__float2bfloat16(v[i][c] * scl[i])), a[c]);
+          }
+          const float sl = A.scale;
+          *reinterpret_cast<uint4*>(A.out + (int64_t)t * A.H + 256 * P.rb + 8 * lane) =
+              make_uint4(pkbf(a[0] * sl, a[1] * sl), pkbf(a[2] * sl, a[3] * sl), pkbf(a[4] * sl, a[5] * sl),
+                         pkbf(a[6] * sl, a[7] * sl));
+        }
+        continue;
+      }
+      int old = 0;
+      if (lane == 0) {
+        old = atom_add_acq_rel(A.state + P.key, 1);
+        if (old == P.np - 1) A.state[P.key] = 0;
+      }
+      __syncwarp();
+      old = __shfl_sync(0xffffffffu, old, 0);
+      if (old != P.np - 1) continue;
+      const int e = slot_e[P.slot], m = slot_m[P.slot], r0 = slot_r0[P.slot];
+      if (P.kind == 0) {
+        const float sc = __ldg(A.gs13 + e) * 9.223372036854775808e18f;
+        const int h = lane >> 4, i0 = (lane & 15) * 4;
+        const int col = 128 * P.rb + 64 * h + dec_kp(i0);
+        for (int tok = 0; tok < m; tok++) {
+          float4 gt = make_float4(0.f, 0.f, 0.f, 0.f), ut = gt;
+          const float* pp = A.part + P.pfirst + tok * 256 + 128 * h + i0;
+#pragma unroll 4
+          for (int j = 0; j < P.np; j++, pp += P.pstride) {
+            const float4 gv = __ldcg(reinterpret_cast<const float4*>(pp)), uv = __ldcg(reinterpret_cast<const float4*>(pp + 64));
+            gt.x += gv.x, gt.y += gv.y, gt.z += gv.z, gt.w += gv.w;
+            ut.x += uv.x, ut.y += uv.y, ut.z += uv.z, ut.w += uv.w;
+          }
+          auto act = [&](float gg, float uu) {
+            gg *= sc;
+            return gg / (1.f + __expf(-gg)) * (uu * sc);
+          };
+          __nv_bfloat16* ir = A.inter + (int64_t)routes[r0 + tok] * A.I + col;
+          *reinterpret_cast<uint32_t*>(ir) = pkbf(act(gt.x, ut.x), act(gt.y, ut.y));
+          *reinterpret_cast<uint32_t*>(ir + 16) = pkbf(act(gt.z, ut.z), act(gt.w, ut.w));
+        }
+        __syncwarp();
+        if (lane == 0) st_release(rdy + P.slot * A.RB1 + P.rb, 1);
+      } else {
+        const float sc = __ldg(A.gs2 + e) * 9.223372036854775808e18f;
+        for (int tok = 0; tok < m; tok++) {
+          float a[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+          const float* pp = A.part + P.pfirst + tok * 256 + 8 * lane;
+#pragma unroll 4
+          for (int j = 0; j < P.np; j++, pp += P.pstride) {
+            const float4 v0 = __ldcg(reinterpret_cast<const float4*>(pp)), v1 = __ldcg(reinterpret_cast<const float4*>(pp + 4));
+            a[0] += v0.x, a[1] += v0.y, a[2] += v0.z, a[3] += v0.w;
+            a[4] += v1.x, a[5] += v1.y, a[6] += v1.z, a[7] += v1.w;
+          }
+          *reinterpret_cast<uint4*>(A.y + (int64_t)routes[r0 + tok] * A.H + 256 * P.rb + 8 * lane) =
+              make_uint4(pkbf(a[0] * sc, a[1] * sc), pkbf(a[2] * sc, a[3] * sc), pkbf(a[4] * sc, a[5] * sc),
+                         pkbf(a[6] * sc, a[7] * sc));
+        }
+      }
+    }
+    if (A.trace && lane == 0 && fw == 0) A.trace[b * 16 + 5] = gtime();
+    // The last CTA to get here resets the ready flags: every CTA's consumers are past their last wait on them.
+    int last = 0;
+    if (lane == 0) {
+      last = atom_add_acq_rel(A.state, 1) == G * DEC_FW - 1;
+    }
+    if (__shfl_sync(0xffffffffu, last, 0)) {
+      for (int i = lane; i < n * A.RB1; i += 32)
+        rdy[i] = 0;
+      if (lane == 0) A.state[0] = 0;
+    }
+  }
+}
+
 // Route count from which the CTA-pair kernel is used (at fewer routes one CTA per tile is faster on the H200).
 inline constexpr int64_t kPairMinRoutes = 16384;
 // Route count up to which one block plans the call (the multi-block count and scatter win above it).
@@ -1842,6 +2418,99 @@ run(tvm::ffi::TensorView x,
             (float)scale,
             static_cast<uint4*>(out.value().data_ptr()));
   }
+}
+
+// Floats of FP32 partial sums dec_k may write for t tokens, r routes, nmax slots on g CTAs (the per-batch bound: every
+// GEMM step stores (g + its row blocks) partials of 256 rows x its largest slot's routes).
+__host__ __device__ __forceinline__ int64_t dec_part_floats(int64_t t, int64_t r, int64_t nmax, int64_t g, int rb1, int rb2) {
+  return 256 * (2 * g * r + (int64_t)(rb1 + rb2) * nmax * t);
+}
+
+// The decode path: the whole call in one dec_k launch, for at most DEC_TMAX tokens and DEC_RMAX routes. Same contract as
+// run() (with out, the weighted sum; without, y per route with zeros for other ranks' routes). part (FP32, at least
+// dec_part_floats) and state (int32, zero before the first call; every call leaves it zero) are the caller's, and two
+// calls must not share them at the same time. thr is the GEMM1 chunk count from which a slot batch closes.
+inline void run_decode(
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView w13,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView gs13,
+    tvm::ffi::TensorView gs2,
+    tvm::ffi::TensorView inter,
+    tvm::ffi::TensorView y,
+    tvm::ffi::TensorView part,
+    tvm::ffi::TensorView state,
+    tvm::ffi::Optional<tvm::ffi::TensorView> topk_weights,
+    tvm::ffi::Optional<tvm::ffi::TensorView> out,
+    double scale,
+    int64_t thr,
+    int64_t dbg_trace,
+    int64_t dbg) {
+  using namespace host;
+  auto T = SymbolicSize{"tokens"};
+  auto H = SymbolicSize{"hidden"};
+  auto K = SymbolicSize{"top_k"};
+  auto R = SymbolicSize{"routes"};
+  auto I = SymbolicSize{"intermediate"};
+  auto E = SymbolicSize{"local_experts"};
+  auto device = SymbolicDevice{};
+  TensorMatcher({T, H}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(x);
+  TensorMatcher({T, K}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs13);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs2);
+  TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(y);
+  TensorMatcher({R, I}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(inter);
+  TensorMatcher({-1}).with_dtype<float>().with_device(device).ensure_alignment(16).verify(part);
+  TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(state);
+  const int64_t t = T.unwrap(), h = H.unwrap(), topk = K.unwrap(), r = R.unwrap(), i = I.unwrap(), e = E.unwrap();
+  RuntimeCheck(r == t * topk, "nvfp4_w4a16_sm90: workspace rows ", r, " != tokens * top_k ", t * topk);
+  RuntimeCheck(t >= 1 && t <= DEC_TMAX && r <= DEC_RMAX, "nvfp4_w4a16_sm90 decode: at most ", DEC_TMAX, " tokens and ",
+               DEC_RMAX, " routes");
+  RuntimeCheck(h >= 256 && h % 256 == 0, "nvfp4_w4a16_sm90: hidden size must be a multiple of 256, got ", h);
+  RuntimeCheck(i >= 128 && i % 128 == 0, "nvfp4_w4a16_sm90: intermediate size must be a multiple of 128, got ", i);
+  RuntimeCheck(e >= 1 && e <= DEC_EMAX, "nvfp4_w4a16_sm90: 1 to 1024 local experts, got ", e);
+  const int RB1 = (int)(2 * i / 256), RB2 = (int)(h / 256), C1 = (int)(h / 64), C2 = (int)(i / 64);
+  TensorMatcher({e, RB1, C1, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w13);
+  TensorMatcher({e, RB2, C2, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2);
+  RuntimeCheck(out.has_value() == topk_weights.has_value(), "nvfp4_w4a16_sm90: out and topk_weights go together");
+  if (out.has_value()) {
+    TensorMatcher({T, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(out.value());
+    TensorMatcher({T, K}).with_dtype<float>().with_device(device).verify(topk_weights.value());
+  }
+  RuntimeCheck(thr >= 1, "nvfp4_w4a16_sm90 decode: thr must be positive");
+  const DLDevice dev = device.unwrap();
+  RuntimeCheck(runtime::get_sm_version(dev.device_id) == 90, "nvfp4_w4a16_sm90: needs an sm_90 (Hopper) GPU");
+  const int sms = (int)runtime::get_sm_count(dev.device_id);
+  const int nmax = (int)std::min(e, r);
+  RuntimeCheck(state.size(0) >= dec_tcnt(nmax, RB1, RB2) + t * RB2, "nvfp4_w4a16_sm90 decode: state too small");
+  RuntimeCheck(part.size(0) >= dec_part_floats(t, r, nmax, sms, RB1, RB2), "nvfp4_w4a16_sm90 decode: part too small");
+  DecArgs A;
+  A.w13 = static_cast<const uint8_t*>(w13.data_ptr());
+  A.w2 = static_cast<const uint8_t*>(w2.data_ptr());
+  A.gs13 = static_cast<const float*>(gs13.data_ptr());
+  A.gs2 = static_cast<const float*>(gs2.data_ptr());
+  A.x = static_cast<const __nv_bfloat16*>(x.data_ptr());
+  A.ids = static_cast<const int*>(topk_ids.data_ptr());
+  A.tw = topk_weights.has_value() ? static_cast<const float*>(topk_weights.value().data_ptr()) : nullptr;
+  A.inter = static_cast<__nv_bfloat16*>(inter.data_ptr());
+  A.y = static_cast<__nv_bfloat16*>(y.data_ptr());
+  A.out = out.has_value() ? static_cast<__nv_bfloat16*>(out.value().data_ptr()) : nullptr;
+  A.part = static_cast<float*>(part.data_ptr());
+  A.state = static_cast<int*>(state.data_ptr());
+  A.trace = reinterpret_cast<unsigned long long*>(dbg_trace);  // DEBUG
+  A.dbg = (int)dbg;                                             // DEBUG
+  A.scale = (float)scale;
+  A.T = (int)t, A.topk = (int)topk, A.E = (int)e, A.H = (int)h, A.I = (int)i;
+  A.RB1 = RB1, A.RB2 = RB2, A.C1 = C1, A.C2 = C2, A.thr = (int)thr, A.nmax = nmax;
+  auto go = [&](auto kern) {
+    runtime::set_max_dynamic_smem_per_device<decltype(kern)::value>(dev, DEC_SMEM);
+    LaunchKernel(sms, DEC_THREADS, dev, DEC_SMEM).enable_cooperative(!(dbg & 32))(decltype(kern)::value, A);
+  };
+  if (t <= 8)
+    go(std::integral_constant<decltype(&dec_k<1>), &dec_k<1>>{});
+  else
+    go(std::integral_constant<decltype(&dec_k<2>), &dec_k<2>>{});
 }
 
 }  // namespace sglang::nvfp4_w4a16_sm90
