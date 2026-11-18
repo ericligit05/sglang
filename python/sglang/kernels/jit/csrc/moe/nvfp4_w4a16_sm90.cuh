@@ -3269,7 +3269,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
   uint8_t* const rows = dsm + misc[5];
   const int per1 = A.RB1 * (g1h ? 8 : 4);
   const int N1 = n * per1, P2 = A.RB2 * 8;
-  const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0, n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0;
+  const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0, n2c = P2 > b && !(A.dbg & 4) ? (P2 - 1 - b) / G + 1 : 0;  // (dbg 4, timing only: no GEMM2)
   const int nc1 = g1h ? A.nc1h : A.nc1;
   const int k1 = (A.C1 + nc1 - 1) / nc1, k2 = (A.C2 + A.nc2 - 1) / A.nc2;
   const int rowi = 2 * A.I + 16, rowx = 2 * A.H + 16;
