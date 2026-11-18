@@ -416,3 +416,76 @@ def test_progress_while_another_kernel_holds_sms(variant):
     assert finished, "no progress on the 16 free SMs within 10s"
     ref, local = _reference(ck, x, ids, E)
     _assert_close(y, ref, local)
+
+
+# ---- the decode kernels (1 to 4 tokens): one launch ("decode_fused") and two launches ("decode_pdl") ----
+
+_DECODE_CASES = [("decode_fused", s, T) for s in SHAPES for T in (1, 2, 3, 4)] + [
+    ("decode_pdl", s, T) for s in ("qwen3_30b", "qwen3_next_ep8") for T in (1, 2, 3, 4)
+] + [("decode_pdl", s, T) for s in ("deepseek_ep8", "eplb36") for T in (1, 2)]
+
+
+@pytest.mark.parametrize("variant,shape,T", _DECODE_CASES)
+def test_decode_token_counts(variant, shape, T):
+    """Each decode kernel at every token count it serves, per-route outputs. Fails on: a tagged word written to the
+    wrong intermediate column (16-row GEMM1 items), a stale word taken as current, a slot's rows read from another
+    slot's shared-memory rows, a GEMM2 group whose slots share a stage but not a column offset, rotating row buffers
+    refilled before every consumer warp is done (DeepSeek at 4 tokens), a two-launch GEMM2 reading the intermediate
+    before its GEMM1 grid finished."""
+    _check(shape, T, variant=variant)
+
+
+@pytest.mark.parametrize("variant", ["decode_fused", "decode_pdl"])
+@pytest.mark.parametrize("kind,remote", [("hot", "minus_one"), ("empty", "minus_one"), ("remote", "minus_one")])
+def test_decode_routing_kinds(variant, kind, remote):
+    """One expert taking most routes, empty experts, no local route at all. Fails on: a hang when no slot exists, a
+    slot with more than one route read with the wrong row stride."""
+    for T in (1, 2):
+        _check("qwen3_30b", T, kind=kind, remote=remote, variant=variant)
+
+
+@pytest.mark.parametrize("variant", ["decode_fused", "decode_pdl"])
+def test_decode_weighted_sum_repeat_and_graph(variant):
+    """The weighted sum against the reference, then a CUDA graph replayed with new routings: every result must match
+    the reference and an eager call bitwise. Fails on: an epoch that does not advance (a later call takes an earlier
+    call's words), weights or scales staged from the wrong route or slot, a host-side routing decision."""
+    H, I, E, Eg, topk = SHAPES["qwen3_30b"]
+    ck, experts = _layer("qwen3_30b")
+    for T in (1, 2):
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=5 + T)
+        w = torch.rand((T, topk), device="cuda")
+        out = torch.empty((T, H), dtype=torch.bfloat16, device="cuda")
+        nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, out=out, scale=2.5, variant=variant)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, out=out, scale=2.5, variant=variant)
+        for rep in range(4):
+            x.copy_(torch.randn((T, H), device="cuda").bfloat16())
+            ids.copy_(_routing(T, topk, E, Eg, kind=("skew", "hot")[rep % 2], seed=40 + rep))
+            graph.replay()
+            eager = nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, scale=2.5, variant=variant)
+            torch.cuda.synchronize()
+            ref, local = _reference(ck, x, ids, E)
+            ref_sum = (ref.view(T, topk, H) * (w * local.view(T, topk)).unsqueeze(-1)).sum(1) * 2.5
+            _assert_close(out, ref_sum, slice(None))
+            assert torch.equal(out, eager)
+
+
+def test_decode_dispatch():
+    """auto takes the one-launch kernel for large experts and the two-launch one for small ones, only up to
+    DECODE_MAX_TOKENS tokens, and gives the same result as the variant it picks. Fails on: a dispatch that sends a
+    shape to a kernel that refuses it, or past the token range."""
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    assert op._decode_variant(1, 8, 32, 7168, 2048) == "decode_fused"
+    assert op._decode_variant(2, 16, 256, 6144, 256) == "decode_pdl"
+    assert op._decode_variant(3, 24, 32, 7168, 2048) == "auto"
+    for shape in ("deepseek_ep8", "qwen3_30b"):
+        H, I, E, Eg, topk = SHAPES[shape]
+        ck, experts = _layer(shape)
+        x = torch.randn((2, H), device="cuda").bfloat16()
+        ids = _routing(2, topk, E, Eg, seed=11)
+        a = nvfp4_w4a16_sm90_moe(x, ids, experts)
+        b = nvfp4_w4a16_sm90_moe(x, ids, experts, variant=op._decode_variant(2, 2 * topk, E, H, I))
+        assert torch.equal(a, b)
