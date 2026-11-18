@@ -3056,7 +3056,7 @@ constexpr int D3_RED = D3_CW * 64 * D3_TMAX * 4;
 constexpr int D3_NSMAX = 6;
 constexpr int D3_NBMAX = 16;
 constexpr int D3_NBAR = 2 * D3_NSMAX + 1 + 2 * D3_NBMAX + 4;
-constexpr int D3_RL = 16;  // 16B loads per fetcher lane per round
+constexpr int D3_RL = 8;  // 16B loads per fetcher lane per round
 constexpr int D3_CH = 64 * D3_RL;  // 16B loads per fetch task (a pair of warps)
 constexpr int D3_FIXED = ((2 * D3_RED + D3_NBAR * 8 + (9 * D3_RMAX + 3 * D3_EMAX + 16) * 4) + 1023) / 1024 * 1024;
 constexpr int D3_SMEM_MAX = 232448;
@@ -3133,7 +3133,11 @@ __device__ __forceinline__ void d3_stage(float (&acc)[4][4], const uint8_t* sb, 
   }
 }
 
+// TR: the debug trace build (every stamp compiled out otherwise, so the kernel's code stays small: after a read
+// flush its first pass through each role's code fetches instructions from HBM)
+template <bool TR>
 __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ D3Maps mp, const D3Args A) {
+  unsigned long long* const TRP = TR ? A.trace : nullptr;
   extern __shared__ __align__(1024) uint8_t dsm[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, G = gridDim.x, b = blockIdx.x;
   float* redb = reinterpret_cast<float*>(dsm);
@@ -3159,7 +3163,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
   };
-  if (A.trace && tid == 0) A.trace[b * D3_TRW] = gtime();
+  if (TRP && tid == 0) TRP[b * D3_TRW] = gtime();
   if (A.dbg & 64) return;  // DEBUG: the launch alone
   uint32_t ep = (uint32_t)A.state[1] + 1u;
   if (ep == 0) ep = 1;
@@ -3282,7 +3286,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
   };
   // GEMM2 item j2's row buffer: its slot's own rows (NB == 0) or buffer j2 % NB
   auto rowbuf = [&](int j2, int s) { return NB == 0 ? rows + slot_r0[s] * rowi : rows + (j2 % NB) * mmax * rowi; };
-  if (A.trace && tid == 0) A.trace[b * D3_TRW + 1] = gtime();
+  if (TRP && tid == 0) TRP[b * D3_TRW + 1] = gtime();
 
   if (warp == D3_CW) {  // producer
     if (lane == 0) {
@@ -3299,7 +3303,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
           const int st = k % NS;
           if (k >= NS) mbar_wait_h(bempty + 8 * st, ((k / NS) + 1) & 1, A.whint);
           const uint32_t dst = rs + st * D3_STB, bar = bfull + 8 * st;
-          if (A.trace && k == 0) A.trace[b * D3_TRW + 2] = gtime();
+          if (TRP && k == 0) TRP[b * D3_TRW + 2] = gtime();
           if (kind == 0 && g1h) {  // hp: unit hp & 1 of gate group 4 (hp >> 2) + ((hp >> 1) & 1) and of its up group
             const int h = hp >> 2, p = (hp >> 1) & 1, u = hp & 1, row = e * A.RB1 + rb;
             mbar_expect(bar, 2 * 576 * nc1);
@@ -3323,7 +3327,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     // Every parameter this warp needs, read once before the stream and pinned in registers: a constant-cache miss
     // during the stream (ptxas rematerializes parameters instead of holding them) can wait several us.
     unsigned long long* F_inter = A.inter;
-    unsigned long long* F_trace = A.trace;
+    unsigned long long* F_trace = TRP;
     int F_dbg = A.dbg, F_whint = A.whint, F_fdly = A.fdly, F_I = A.I;
     asm volatile("" : "+l"(F_inter), "+l"(F_trace), "+r"(F_dbg), "+r"(F_whint), "+r"(F_fdly), "+r"(F_I));
     // A task is one chunk of D3_CH 16B loads: in per-slot mode a chunk of every local route's row in slot order (a
@@ -3396,31 +3400,33 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
         ts_go = gtime();
       }
       __syncwarp();
-      auto src = [&](int i) {
-        return F_inter + (int64_t)routes[pos0 + i / per] * (F_I / 2) + (i % per) * 2;
-      };
       for (int c0 = f0; c0 < f1; c0 += D3_CH) {
+        // One division per chunk: a lane's 16B words are 64 apart, so its (row, column) advance by 64 with a carry
+        // (per >= 32). The hot path stays a few hundred instructions: after a read flush every instruction line this
+        // warp runs for the first time comes from HBM.
         uint4 v[D3_RL];
-        const unsigned long long* sp[D3_RL];  // every address first, so the loads issue back to back
+        const unsigned long long* sp[D3_RL];
+        int doff[D3_RL];
         uint32_t pend = 0;
+        {
+          const int i0 = c0 + wi * 32 + lane;
+          int row = i0 / per, col = i0 - row * per;
 #pragma unroll
-        for (int u = 0; u < D3_RL; u++) {
-          const int i = c0 + u * 64 + wi * 32 + lane;
-          sp[u] = src(min(i, f1 - 1));
-          if (i < f1) pend |= 1u << u;
+          for (int u = 0; u < D3_RL; u++) {
+            const bool ok = i0 + u * 64 < f1;
+            sp[u] = ok ? F_inter + (int64_t)routes[pos0 + row] * (F_I / 2) + col * 2 : F_inter;
+            doff[u] = row * rowi + col * 8;
+            pend |= (ok ? 1u : 0u) << u;
+            col += 64;
+            while (col >= per) col -= per, row++;
+          }
         }
-        // DEBUG (not dbg 32): task 0's first chunk, slot 47 addresses ready, 40 loads issued, 41 + r round r checked
+        // DEBUG (trace builds, not dbg 32): task 0's first chunk, addresses ready, loads issued, first check done
         const bool tr0 = F_trace && !(F_dbg & 32) && t == fp && fp == 0 && wi == 0 && lane == 0 && c0 == f0;
         if (tr0) ts_addr = gtime();
-        if (F_dbg & 4) {  // DEBUG: weak loads
 #pragma unroll
-          for (int u = 0; u < D3_RL; u++)
-            v[u] = ld_cg4(sp[u]);
-        } else {
-#pragma unroll
-          for (int u = 0; u < D3_RL; u++)
-            v[u] = ld_relaxed_2u64(sp[u]);
-        }
+        for (int u = 0; u < D3_RL; u++)
+          v[u] = ld_relaxed_2u64(sp[u]);
         if (tr0) ts_iss = gtime();
         int rr = 0;
         while (true) {
@@ -3428,8 +3434,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
 #pragma unroll
           for (int u = D3_RL - 1; u >= 0; u--) {
             if (((pend >> u) & 1u) && ((v[u].y == ep && v[u].w == ep) || (F_dbg & 2))) {
-              const int i = c0 + u * 64 + wi * 32 + lane;
-              *reinterpret_cast<uint2*>(bb + (i / per) * rowi + (i % per) * 8) = make_uint2(v[u].x, v[u].z);
+              *reinterpret_cast<uint2*>(bb + doff[u]) = make_uint2(v[u].x, v[u].z);
               pend &= ~(1u << u);
             }
           }
@@ -3438,7 +3443,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
           if (!__any_sync(0xffffffffu, pend != 0)) break;
 #pragma unroll
           for (int u = 0; u < D3_RL; u++)
-            if ((pend >> u) & 1u) v[u] = (F_dbg & 4) ? ld_cg4(sp[u]) : ld_relaxed_2u64(sp[u]);
+            if ((pend >> u) & 1u) v[u] = ld_relaxed_2u64(sp[u]);
         }
       }
       __syncwarp();
@@ -3492,9 +3497,9 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
         if (lane == 0) {
           mbar_arrive(bre + 8 * hb);
           *reinterpret_cast<volatile int*>(misc + 1) = it + 1;
-          if (A.trace) {
-            A.trace[b * D3_TRW + 14] = gtime();
-            if (it == 0) A.trace[b * D3_TRW + 15] = gtime();
+          if (TRP) {
+            TRP[b * D3_TRW + 14] = gtime();
+            if (it == 0) TRP[b * D3_TRW + 15] = gtime();
           }
         }
       } else {
@@ -3519,7 +3524,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
         }
         __syncwarp();
         if (lane == 0) mbar_arrive(bre + 8 * hb);
-        if (A.trace && (A.dbg & 128) && lane == 0 && it - n1c < 8) A.trace[b * D3_TRW + 24 + it - n1c] = gtime();
+        if (TRP && (A.dbg & 128) && lane == 0 && it - n1c < 8) TRP[b * D3_TRW + 24 + it - n1c] = gtime();
         if (s == n - 1) {
           if (A.tw != nullptr) {
 #pragma unroll
@@ -3557,15 +3562,15 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
       if (kind == 0) {
         if (g < m) brow = dsm + A.off_x + (routes[r0 + g] / A.topk) * rowx;
       } else {
-        const uint64_t t0 = A.trace ? gtime() : 0;
+        const uint64_t t0 = TRP ? gtime() : 0;
         if (NB == 0) {
           const int per = A.I / 4;
           for (int c = r0 * per / D3_CH; c <= ((r0 + m) * per - 1) / D3_CH; c++)
             mbar_wait_h(bif + 8 * c, 0, A.whint);
         } else
           mbar_wait_h(bif + 8 * (j2 % NB), (j2 / NB) & 1, A.whint);
-        if (A.trace) wb_ += gtime() - t0;
-        if (A.trace && (A.dbg & 128) && tid == 0 && j2 < 8) A.trace[b * D3_TRW + 32 + j2] = gtime();
+        if (TRP) wb_ += gtime() - t0;
+        if (TRP && (A.dbg & 128) && tid == 0 && j2 < 8) TRP[b * D3_TRW + 32 + j2] = gtime();
         if (g < m) brow = rowbuf(j2, s) + g * rowi;
       }
       float acc[4][4];
@@ -3580,12 +3585,12 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
       for (int j = 0; j < ks; j++) {
         const int st = k % NS;
         if (sub == 0) {
-          const uint64_t t0 = A.trace ? gtime() : 0;
+          const uint64_t t0 = TRP ? gtime() : 0;
           mbar_wait_h(bfull + 8 * st, (k / NS) & 1, A.whint);
-          if (A.trace) wf_ += gtime() - t0;
+          if (TRP) wf_ += gtime() - t0;
         }
-        if (A.trace && tid == 0) A.trace[b * D3_TRW + 3] = gtime();
-        if (A.trace && (A.dbg & 128) && tid == 0 && kind == 1 && j == 0 && j2 < 8) A.trace[b * D3_TRW + 16 + j2] = gtime();
+        if (TRP && tid == 0) TRP[b * D3_TRW + 3] = gtime();
+        if (TRP && (A.dbg & 128) && tid == 0 && kind == 1 && j == 0 && j2 < 8) TRP[b * D3_TRW + 16 + j2] = gtime();
         const uint8_t* sb = ring + st * D3_STB + sub * 1152 * A.nc2;
         const int nv = min(nc, C - j * nc);
         if (A.dbg & 1) {
@@ -3624,10 +3629,10 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
       __syncwarp();
       if (lane == 0) mbar_arrive(brf + 8 * hb);
     }
-    if (A.trace && tid == 0) A.trace[b * D3_TRW + 5] = wb_, A.trace[b * D3_TRW + 6] = wf_;
+    if (TRP && tid == 0) TRP[b * D3_TRW + 5] = wb_, TRP[b * D3_TRW + 6] = wf_;
   }
   __syncthreads();
-  if (A.trace && tid == 0) A.trace[b * D3_TRW + 4] = gtime();
+  if (TRP && tid == 0) TRP[b * D3_TRW + 4] = gtime();
   // The last CTA to finish advances the epoch (the next call's reads of it are ordered by the kernel boundary).
   if (tid == 0) {
     __threadfence();
@@ -3740,8 +3745,13 @@ inline void run_decode3(
   A.dbg = (int)(cfg & 0xff);
   A.trace = reinterpret_cast<unsigned long long*>(trace);
   const int grid = ctas > 0 ? (int)std::min<int64_t>(ctas, sms) : sms;
-  runtime::set_max_dynamic_smem_per_device<dec3_k>(dev, D3_SMEM_MAX);
-  LaunchKernel(grid, D3_THREADS, dev, A.smem).enable_cooperative(!(A.dbg & 16))(dec3_k, mp, A);
+  if (A.trace != nullptr) {
+    runtime::set_max_dynamic_smem_per_device<dec3_k<true>>(dev, D3_SMEM_MAX);
+    LaunchKernel(grid, D3_THREADS, dev, A.smem).enable_cooperative(!(A.dbg & 16))(dec3_k<true>, mp, A);
+  } else {
+    runtime::set_max_dynamic_smem_per_device<dec3_k<false>>(dev, D3_SMEM_MAX);
+    LaunchKernel(grid, D3_THREADS, dev, A.smem).enable_cooperative(!(A.dbg & 16))(dec3_k<false>, mp, A);
+  }
 }
 
 }  // namespace sglang::nvfp4_w4a16_sm90
