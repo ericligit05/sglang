@@ -3058,7 +3058,7 @@ constexpr int D3_NBMAX = 16;
 constexpr int D3_NBAR = 2 * D3_NSMAX + 1 + 2 * D3_NBMAX + 4;
 constexpr int D3_RL = 16;  // 16B loads per fetcher lane per round
 constexpr int D3_CH = 64 * D3_RL;  // 16B loads per fetch task (a pair of warps)
-constexpr int D3_FIXED = ((2 * D3_RED + D3_NBAR * 8 + (9 * D3_RMAX + D3_EMAX + 16) * 4) + 1023) / 1024 * 1024;
+constexpr int D3_FIXED = ((2 * D3_RED + D3_NBAR * 8 + (9 * D3_RMAX + 3 * D3_EMAX + 16) * 4) + 1023) / 1024 * 1024;
 constexpr int D3_SMEM_MAX = 232448;
 
 struct D3Maps {
@@ -3076,7 +3076,7 @@ struct D3Args {
   int* state;  // [0] CTAs done, [1] the last call's epoch
   float scale;
   int T, topk, E, H, I, RB1, RB2, C1, C2, nc1, nc1h, nc2;
-  int off_x, smem, nsmax, g1h, fdly;
+  int off_x, smem, nsmax, g1h, fdly, whint;
   int dbg;                    // DEBUG: 1 no consumer math, 2 take every word fresh (one round), 16 plain launch
   unsigned long long* trace;  // DEBUG
 };
@@ -3089,6 +3089,17 @@ __device__ __forceinline__ uint4 ld_relaxed_2u64(const unsigned long long* p) {
   unsigned long long a, c;
   asm volatile("ld.relaxed.gpu.global.v2.b64 {%0, %1}, [%2];" : "=l"(a), "=l"(c) : "l"(p) : "memory");
   return make_uint4((uint32_t)a, (uint32_t)(a >> 32), (uint32_t)c, (uint32_t)(c >> 32));
+}
+
+__device__ __forceinline__ void mbar_wait_h(uint32_t bar, uint32_t parity, uint32_t hint) {
+  if (hint == 0) {
+    mbar_wait(bar, parity);
+    return;
+  }
+  asm volatile(
+      "{\n .reg .pred p;\n W: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1, %2;\n @!p bra W;\n}" ::"r"(bar),
+      "r"(parity), "r"(hint)
+      : "memory");
 }
 
 // One stage for this consumer warp: chunks w, w + 8, ... (< nv), chunk stride cs, U units of 16 rows at uoff[u].
@@ -3135,7 +3146,8 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
   float* sgs13 = reinterpret_cast<float*>(routes + D3_RMAX);  // per slot
   float* sgs2 = sgs13 + D3_RMAX;
   float* stw = sgs2 + D3_RMAX;  // per route (in route order)
-  int* scnt = reinterpret_cast<int*>(stw + D3_RMAX);
+  float* egs = stw + D3_RMAX;  // per expert: gs13, then gs2 at + D3_EMAX
+  int* scnt = reinterpret_cast<int*>(egs + 2 * D3_EMAX);
   int* misc = scnt + D3_EMAX;  // [0] slots, [1] own GEMM1 items written, [2] ring stages, [3] row buffers (0: per slot)
                                // [4] ring offset, [5] rows offset, [6] rows per buffer, [7] half GEMM1 items
   const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
@@ -3172,8 +3184,11 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     sids[i] = A.ids[i];
     stw[i] = A.tw != nullptr ? A.tw[i] : 0.f;
   }
-  for (int e = tid; e < E; e += D3_THREADS)
+  for (int e = tid; e < E; e += D3_THREADS) {
     scnt[e] = 0;
+    egs[e] = A.gs13[e] * 9.223372036854775808e18f;
+    egs[D3_EMAX + e] = A.gs2[e] * 9.223372036854775808e18f;
+  }
   __syncthreads();
   if (tid == D3_CW * 32) {  // every token's x row (padded by 16B)
     mbar_expect(bx, A.T * 2 * A.H);
@@ -3199,8 +3214,8 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     }
     __syncwarp();
     for (int s = lane; s < n; s += 32) {
-      sgs13[s] = A.gs13[slot_e[s]] * 9.223372036854775808e18f;
-      sgs2[s] = A.gs2[slot_e[s]] * 9.223372036854775808e18f;
+      sgs13[s] = egs[slot_e[s]];
+      sgs2[s] = egs[D3_EMAX + slot_e[s]];
     }
     if (lane == 0) {
       int r0 = 0, mmax = 1;
@@ -3253,6 +3268,8 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
   const int k1 = (A.C1 + nc1 - 1) / nc1, k2 = (A.C2 + A.nc2 - 1) / A.nc2;
   const int nitems = n1c + n2c * n;
   const int rowi = 2 * A.I + 16, rowx = 2 * A.H + 16;
+  // GEMM2 items whose weights are one small block (k2 == 1) share ring stages: G2 consecutive slots of a piece
+  const int G2 = k2 == 1 ? max(1, min(8, D3_STB / (1152 * A.nc2))) : 1;
   // item it: GEMM1 (it < n1c; slot s, row block rb, part hp) or GEMM2 (piece (it - n1c) / n, slot (it - n1c) % n)
   auto item = [&](int it, int& kind, int& s, int& rb, int& hp) {
     if (it < n1c) {
@@ -3277,9 +3294,10 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
         item(it, kind, s, rb, hp);
         const int e = slot_e[s];
         const int ks = kind ? k2 : k1;
+        if (kind == 1 && s % G2 != 0) continue;  // issued with its group's first slot
         for (int j = 0; j < ks; j++, k++) {
           const int st = k % NS;
-          if (k >= NS) mbar_wait(bempty + 8 * st, ((k / NS) + 1) & 1);
+          if (k >= NS) mbar_wait_h(bempty + 8 * st, ((k / NS) + 1) & 1, A.whint);
           const uint32_t dst = rs + st * D3_STB, bar = bfull + 8 * st;
           if (A.trace && k == 0) A.trace[b * D3_TRW + 2] = gtime();
           if (kind == 0 && g1h) {  // hp: unit hp & 1 of gate group 4 (hp >> 2) + ((hp >> 1) & 1) and of its up group
@@ -3293,8 +3311,10 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
             tma_4d_h(dst, &mp.w13, 0, 4 * h + p, j * nc1, row, bar, pol);
             tma_4d_h(dst + 1152 * nc1, &mp.w13, 0, 4 * h + 2 + p, j * nc1, row, bar, pol);
           } else {
-            mbar_expect(bar, 1152 * A.nc2);
-            tma_4d_h(dst, &mp.w2, 0, hp, j * A.nc2, e * A.RB2 + rb, bar, pol);
+            const int gsz = min(G2, n - s);
+            mbar_expect(bar, gsz * 1152 * A.nc2);
+            for (int u = 0; u < gsz; u++)
+              tma_4d_h(dst + u * 1152 * A.nc2, &mp.w2, 0, hp, j * A.nc2, slot_e[s + u] * A.RB2 + rb, bar, pol);
           }
         }
       }
@@ -3309,21 +3329,38 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     const int nr = n > 0 ? slot_r0[n - 1] + slot_m[n - 1] : 0;
     const int ntask = n2c > 0 ? (NB == 0 ? (nr * per + D3_CH - 1) / D3_CH : n2c * n) : 0;
     int rounds = 0;
-    if ((A.dbg & 32) && fw == 2 && lane == 0 && A.trace) {
-      // DEBUG: the round trip of one relaxed load during the stream, 16 samples at least 2us apart; slots 16 + i
-      // issue time, 32 + i latency (ns)
-      const unsigned long long* pa = A.inter + (int64_t)(b % 8) * 64;
+    if ((A.dbg & 32) && fw == 2 && A.trace && n > 0) {
+      // DEBUG: round trips during the stream, 16 samples 2us apart, kind i % 3: 0 one 16B load (lane 0), 1 one 16B
+      // load per lane (512B), 2 sixteen per lane (8KB, the fetch's pattern); slots 16 + i issue time, 32 + i latency
+      const unsigned long long* pa = A.inter + (int64_t)routes[0] * (A.I / 2);
       uint64_t tn = gtime();
       for (int i = 0; i < 16; i++) {
         while (gtime() < tn)
           __nanosleep(64);
+        __syncwarp();
         const uint64_t t0 = gtime();
-        const uint4 v = ld_relaxed_2u64(pa);
-        if (v.x == 0x7fffffffu) misc[8] = 1;  // the value is used before the time is read
+        uint32_t acc = 0;
+        if (i % 3 == 0) {
+          if (lane == 0) acc = ld_relaxed_2u64(pa).x;
+        } else if (i % 3 == 1) {
+          acc = ld_relaxed_2u64(pa + 2 * lane).x;
+        } else {
+          uint4 v[16];
+#pragma unroll
+          for (int u = 0; u < 16; u++)
+            v[u] = ld_relaxed_2u64(pa + 2 * ((u * 32 + lane) % (A.I / 4)));
+#pragma unroll
+          for (int u = 0; u < 16; u++)
+            acc ^= v[u].x;
+        }
+        if (acc == 0x7fffffffu) misc[8] = 1;  // every value is used before the time is read
         asm volatile("" ::: "memory");
+        __syncwarp();
         const uint64_t t1 = gtime();
-        A.trace[b * D3_TRW + 16 + i] = t0;
-        A.trace[b * D3_TRW + 32 + i] = t1 - t0;
+        if (lane == 0) {
+          A.trace[b * D3_TRW + 16 + i] = t0;
+          A.trace[b * D3_TRW + 32 + i] = t1 - t0;
+        }
         tn = t0 + 2000;
       }
     }
@@ -3338,7 +3375,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
           s++;
       } else {
         s = t % n, pos0 = slot_r0[s], f0 = 0, f1 = slot_m[s] * per, bb = rowbuf(t, s);
-        if (t >= NB) mbar_wait(bie + 8 * (t % NB), ((t / NB) + 1) & 1);
+        if (t >= NB) mbar_wait_h(bie + 8 * (t % NB), ((t / NB) + 1) & 1, A.whint);
       }
       const int need = min(n1c, ((s + 1) * per1 + G - 1) / G);
       if (lane == 0) {
@@ -3357,15 +3394,28 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
       };
       for (int c0 = f0; c0 < f1; c0 += D3_CH) {
         uint4 v[D3_RL];
+        const unsigned long long* sp[D3_RL];  // every address first, so the loads issue back to back
         uint32_t pend = 0;
 #pragma unroll
         for (int u = 0; u < D3_RL; u++) {
           const int i = c0 + u * 64 + wi * 32 + lane;
-          if (i < f1) {
-            v[u] = ld_relaxed_2u64(src(i));
-            pend |= 1u << u;
-          }
+          sp[u] = src(min(i, f1 - 1));
+          if (i < f1) pend |= 1u << u;
         }
+        // DEBUG (not dbg 32): task 0's first chunk, slot 47 addresses ready, 40 loads issued, 41 + r round r checked
+        const bool tr0 = A.trace && !(A.dbg & 32) && t == fp && fp == 0 && wi == 0 && lane == 0 && c0 == f0;
+        if (tr0) A.trace[b * D3_TRW + 47] = gtime();
+        if (A.dbg & 4) {  // DEBUG: weak loads
+#pragma unroll
+          for (int u = 0; u < D3_RL; u++)
+            v[u] = ld_cg4(sp[u]);
+        } else {
+#pragma unroll
+          for (int u = 0; u < D3_RL; u++)
+            v[u] = ld_relaxed_2u64(sp[u]);
+        }
+        if (tr0) A.trace[b * D3_TRW + 40] = gtime();
+        int rr = 0;
         while (true) {
           rounds++;
 #pragma unroll
@@ -3376,10 +3426,12 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
               pend &= ~(1u << u);
             }
           }
+          if (tr0 && rr < 6) A.trace[b * D3_TRW + 41 + rr] = gtime();  // (41 .. 46)
+          rr++;
           if (!__any_sync(0xffffffffu, pend != 0)) break;
 #pragma unroll
           for (int u = 0; u < D3_RL; u++)
-            if ((pend >> u) & 1u) v[u] = ld_relaxed_2u64(src(c0 + u * 64 + wi * 32 + lane));
+            if ((pend >> u) & 1u) v[u] = (A.dbg & 4) ? ld_cg4(sp[u]) : ld_relaxed_2u64(sp[u]);
         }
       }
       __syncwarp();
@@ -3398,7 +3450,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
       int kind, s, rb, hp;
       item(it, kind, s, rb, hp);
       const int hb = it & 1, m = slot_m[s], r0 = slot_r0[s];
-      mbar_wait(brf + 8 * hb, (it >> 1) & 1);
+      mbar_wait_h(brf + 8 * hb, (it >> 1) & 1, A.whint);
       const float* red = redb + hb * (D3_RED / 4);
       const int jr = lane;
       if (kind == 0) {
@@ -3479,7 +3531,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     const int g = lane >> 2, q = lane & 3;
     int k = 0;
     uint64_t wb_ = 0, wf_ = 0;
-    if (n1c > 0) mbar_wait(bx, 0);
+    if (n1c > 0) mbar_wait_h(bx, 0, A.whint);
     for (int it = 0; it < nitems; it++) {
       int kind, s, rb, hp;
       item(it, kind, s, rb, hp);
@@ -3493,9 +3545,9 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
         if (NB == 0) {
           const int per = A.I / 4;
           for (int c = r0 * per / D3_CH; c <= ((r0 + m) * per - 1) / D3_CH; c++)
-            mbar_wait(bif + 8 * c, 0);
+            mbar_wait_h(bif + 8 * c, 0, A.whint);
         } else
-          mbar_wait(bif + 8 * (j2 % NB), (j2 / NB) & 1);
+          mbar_wait_h(bif + 8 * (j2 % NB), (j2 / NB) & 1, A.whint);
         if (A.trace) wb_ += gtime() - t0;
         if (g < m) brow = rowbuf(j2, s) + g * rowi;
       }
@@ -3506,15 +3558,17 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
         for (int i = 0; i < 4; i++)
           acc[u][i] = 0.f;
       const int ks = kind ? k2 : k1;
-      for (int j = 0; j < ks; j++, k++) {
+      const int sub = kind == 1 ? s % G2 : 0;
+      const bool glast = kind == 0 || sub == G2 - 1 || s == n - 1;
+      for (int j = 0; j < ks; j++) {
         const int st = k % NS;
-        {
+        if (sub == 0) {
           const uint64_t t0 = A.trace ? gtime() : 0;
-          mbar_wait(bfull + 8 * st, (k / NS) & 1);
+          mbar_wait_h(bfull + 8 * st, (k / NS) & 1, A.whint);
           if (A.trace) wf_ += gtime() - t0;
         }
         if (A.trace && tid == 0) A.trace[b * D3_TRW + 3] = gtime();
-        const uint8_t* sb = ring + st * D3_STB;
+        const uint8_t* sb = ring + st * D3_STB + sub * 1152 * A.nc2;
         const int nv = min(nc, C - j * nc);
         if (A.dbg & 1) {
         } else if (kind == 0 && g1h) {
@@ -3527,15 +3581,18 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
           const int uo[4] = {0, 576, 0, 0};
           d3_stage<2>(acc, sb, uo, 1152, nv, brow, j * nc, warp, lane);
         }
-        __syncwarp();
-        if (lane == 0) mbar_arrive(bempty + 8 * st);
+        if (glast) {
+          __syncwarp();
+          if (lane == 0) mbar_arrive(bempty + 8 * st);
+          k++;
+        }
       }
       if (kind == 1 && NB != 0) {
         __syncwarp();
         if (lane == 0) mbar_arrive(bie + 8 * (j2 % NB));
       }
       const int hb = it & 1;
-      if (it >= 2) mbar_wait(bre + 8 * hb, ((it >> 1) + 1) & 1);
+      if (it >= 2) mbar_wait_h(bre + 8 * hb, ((it >> 1) + 1) & 1, A.whint);
       float* red = redb + hb * (D3_RED / 4);
       const int U = kind ? 2 : (g1h ? 2 : 4);
 #pragma unroll
@@ -3564,7 +3621,8 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
 }
 
 // cfg: bits 0-7 dbg (64: return at entry), 8-11 ring stages cap (0: 5), 12-13 GEMM1 half items (0 auto, 1 off, 2 on),
-// 16-27 fdly in 10ns (0xfff: the default), 28-31 shared memory cap in 16KB (0 or past the max: the max).
+// 16-23 fdly in 10ns (0xff: the default), 24-27 wait suspend hint 32ns << k (0 spin, 15 the default 2us), 28-31 shared
+// memory cap in 16KB (0 or past the max: the max).
 inline void run_decode3(
     tvm::ffi::TensorView x,
     tvm::ffi::TensorView topk_ids,
@@ -3654,8 +3712,10 @@ inline void run_decode3(
   const int nscap = (int)((cfg >> 8) & 15);
   A.nsmax = std::min(D3_NSMAX, nscap ? nscap : 5);
   A.g1h = (int)((cfg >> 12) & 3);
-  const int fd = (int)((cfg >> 16) & 0xfff);
-  A.fdly = fd == 0xfff ? 1000 : 10 * fd;
+  const int fd = (int)((cfg >> 16) & 0xff);
+  A.fdly = fd == 0xff ? 1000 : 10 * fd;
+  const int hk = (int)((cfg >> 24) & 15);
+  A.whint = hk == 15 ? 2048 : hk == 0 ? 0 : 32 << hk;
   const int smcap = (int)((cfg >> 28) & 15);
   if (smcap > 0) A.smem = std::min(A.smem, smcap * 16384);
   RuntimeCheck(oring + 2 * D3_STB + 2 * t * (2 * i + 16) <= A.smem, "nvfp4_w4a16_sm90 decode3: shared memory cap too small");
