@@ -3028,4 +3028,605 @@ inline void run_decode2(
   LaunchKernel(grid, D2_THREADS, dev, smem).enable_cooperative(!(dbg & 16))(dec2_k, mp, A);
 }
 
+
+// ---- decode path 3 (dec3_k): dec2_k's row ownership with an early, tagged intermediate exchange ----
+// On H100 a global load issued while the weight stream runs returns only after the SM's queued copies (several us),
+// so dec3_k keeps every such round trip off the path from a slot's last GEMM1 write to its first GEMM2 stage:
+//   * Per slot scales and per route weights are staged in shared memory with the routing, before the stream starts.
+//   * GEMM1 writes the intermediate as 8-byte words (two BF16 values, this call's epoch above them), so a reader needs
+//     no counter, no fence and no second round trip: a word with this call's epoch holds this call's values.
+//   * Every local route's intermediate row has its own shared-memory row when they fit (each slot is fetched once for
+//     all of this CTA's GEMM2 pieces); otherwise slots rotate through as many buffers as fit, as in dec2_k.
+//   * Four fetcher warps in two pairs take the slots alternately, so two slots' fetches are in flight at once. A
+//     pair starts a slot's first round once this CTA's own GEMM1 items of the slot and every earlier slot are written
+//     plus fdly ns (every CTA runs the same schedule, so the other writers are about as far along), then reloads only
+//     the words whose epoch is still old.
+//   * When a CTA would otherwise get few GEMM1 items, they are 16 gate and 16 up rows instead of 32 and 32 (stages of
+//     576B x 32 chunks), so all CTAs stream GEMM1 and its slots finish earlier.
+constexpr int D3_CW = 8;                          // consumer warps
+constexpr int D3_NF = 4;                          // fetcher warps (two pairs)
+constexpr int D3_THREADS = (D3_CW + 2 + D3_NF) * 32;  // + producer, epilogue
+constexpr int D3_STB = 36864;
+constexpr int D3_TMAX = 4;
+constexpr int D3_RMAX = 256;
+constexpr int D3_EMAX = 1024;
+constexpr int D3_RED = D3_CW * 64 * D3_TMAX * 4;
+constexpr int D3_NSMAX = 6;
+constexpr int D3_NBMAX = 16;
+constexpr int D3_NBAR = 2 * D3_NSMAX + 1 + 2 * D3_NBMAX + 4;
+constexpr int D3_RL = 16;  // 16B loads per fetcher lane per round
+constexpr int D3_FIXED = ((2 * D3_RED + D3_NBAR * 8 + (9 * D3_RMAX + D3_EMAX + 16) * 4) + 1023) / 1024 * 1024;
+constexpr int D3_SMEM_MAX = 232448;
+
+struct D3Maps {
+  CUtensorMap w13, w13h, w2;  // w13h: boxes of one 576B unit x nc chunks (16 rows)
+};
+struct D3Args {
+  const __nv_bfloat16* x;
+  const int* ids;
+  const float* tw;
+  const float* gs13;
+  const float* gs2;
+  unsigned long long* inter;  // [routes][I / 2] tagged words, persistent (zero before the first call)
+  __nv_bfloat16* y;
+  __nv_bfloat16* out;
+  int* state;  // [0] CTAs done, [1] the last call's epoch
+  float scale;
+  int T, topk, E, H, I, RB1, RB2, C1, C2, nc1, nc1h, nc2;
+  int off_x, smem, nsmax, g1h, fdly;
+  int dbg;                    // DEBUG: 1 no consumer math, 2 take every word fresh (one round), 16 plain launch
+  unsigned long long* trace;  // DEBUG
+};
+
+__device__ __forceinline__ void st_relaxed_u64(unsigned long long* p, unsigned long long v) {
+  asm volatile("st.relaxed.gpu.global.b64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+// two 8-byte words, each single-copy atomic: its epoch and its two values are seen together
+__device__ __forceinline__ uint4 ld_relaxed_2u64(const unsigned long long* p) {
+  unsigned long long a, c;
+  asm volatile("ld.relaxed.gpu.global.v2.b64 {%0, %1}, [%2];" : "=l"(a), "=l"(c) : "l"(p) : "memory");
+  return make_uint4((uint32_t)a, (uint32_t)(a >> 32), (uint32_t)c, (uint32_t)(c >> 32));
+}
+
+// One stage for this consumer warp: chunks w, w + 8, ... (< nv), chunk stride cs, U units of 16 rows at uoff[u].
+template <int U>
+__device__ __forceinline__ void d3_stage(float (&acc)[4][4], const uint8_t* sb, const int (&uoff)[4], int cs, int nv,
+                                         const uint8_t* brow, int k0, int warp, int lane) {
+  const int q = lane & 3;
+  for (int c = warp; c < nv; c += D3_CW) {
+    uint4 b0 = make_uint4(0, 0, 0, 0), b1 = b0;
+    if (brow != nullptr) {
+      const uint8_t* bp = brow + (k0 + c) * 128 + q * 32;
+      b0 = *reinterpret_cast<const uint4*>(bp);
+      b1 = *reinterpret_cast<const uint4*>(bp + 16);
+    }
+    const uint8_t* cb = sb + c * cs;
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+      const uint8_t* up = cb + uoff[u];
+      const uint4 nb = *reinterpret_cast<const uint4*>(up + lane * 16);
+      const uint32_t Sc = sc_bf16(*reinterpret_cast<const uint16_t*>(up + 512 + lane * 2), 0x4140);
+#pragma unroll
+      for (int kk = 0; kk < 4; kk++) {
+        uint32_t o[4];
+        decode4(u4w(nb, kk), o);
+        const uint32_t a0 = bmulh(o[0], Sc, 0), a1 = bmulh(o[1], Sc, 1), a2 = bmulh(o[2], Sc, 0),
+                       a3 = bmulh(o[3], Sc, 1);
+        const uint4& bv = kk < 2 ? b0 : b1;
+        mma16816(acc[u], a0, a1, a2, a3, u4w(bv, 2 * (kk & 1)), u4w(bv, 2 * (kk & 1) + 1));
+      }
+    }
+  }
+}
+
+__global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ D3Maps mp, const D3Args A) {
+  extern __shared__ __align__(1024) uint8_t dsm[];
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, G = gridDim.x, b = blockIdx.x;
+  float* redb = reinterpret_cast<float*>(dsm);
+  uint64_t* bars = reinterpret_cast<uint64_t*>(dsm + 2 * D3_RED);
+  int* sids = reinterpret_cast<int*>(bars + D3_NBAR);
+  int* slot_e = sids + D3_RMAX;
+  int* slot_m = slot_e + D3_RMAX;
+  int* slot_r0 = slot_m + D3_RMAX;
+  int* routes = slot_r0 + D3_RMAX;
+  float* sgs13 = reinterpret_cast<float*>(routes + D3_RMAX);  // per slot
+  float* sgs2 = sgs13 + D3_RMAX;
+  float* stw = sgs2 + D3_RMAX;  // per route (in route order)
+  int* scnt = reinterpret_cast<int*>(stw + D3_RMAX);
+  int* misc = scnt + D3_EMAX;  // [0] slots, [1] own GEMM1 items written, [2] ring stages, [3] row buffers (0: per slot)
+                               // [4] ring offset, [5] rows offset, [6] rows per buffer, [7] half GEMM1 items
+  const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
+  const uint32_t bfull = bar0, bempty = bar0 + 8 * D3_NSMAX, bx = bar0 + 16 * D3_NSMAX, bif = bx + 8,
+                 bie = bif + 8 * D3_NBMAX, brf = bie + 8 * D3_NBMAX, bre = brf + 16;
+  const int R = A.T * A.topk, E = A.E;
+  auto gtime = []() {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+  };
+  if (A.trace && tid == 0) A.trace[b * 16] = gtime();
+  uint32_t ep = (uint32_t)A.state[1] + 1u;
+  if (ep == 0) ep = 1;
+
+  if (tid == 0) {
+    for (int s = 0; s < D3_NSMAX; s++) {
+      mbar_init(bfull + 8 * s, 1);
+      mbar_init(bempty + 8 * s, D3_CW);
+    }
+    mbar_init(bx, 1);
+    for (int s = 0; s < D3_NBMAX; s++) {
+      mbar_init(bif + 8 * s, 2);
+      mbar_init(bie + 8 * s, D3_CW);
+    }
+    for (int s = 0; s < 2; s++) {
+      mbar_init(brf + 8 * s, D3_CW);
+      mbar_init(bre + 8 * s, 1);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < R; i += D3_THREADS) {
+    sids[i] = A.ids[i];
+    stw[i] = A.tw != nullptr ? A.tw[i] : 0.f;
+  }
+  for (int e = tid; e < E; e += D3_THREADS)
+    scnt[e] = 0;
+  __syncthreads();
+  if (tid == D3_CW * 32) {  // every token's x row (padded by 16B)
+    mbar_expect(bx, A.T * 2 * A.H);
+    for (int t = 0; t < A.T; t++)
+      bulk_g2s((uint32_t)__cvta_generic_to_shared(dsm + A.off_x + t * (2 * A.H + 16)), A.x + (int64_t)t * A.H,
+               2 * A.H, bx, pol_evict_first());
+  }
+  for (int i = tid; i < R; i += D3_THREADS)
+    if ((unsigned)sids[i] < (unsigned)E) atomicAdd(&scnt[sids[i]], 1);
+  __syncthreads();
+  if (warp == 0) {
+    int n = 0;
+    for (int e0 = 0; e0 < E; e0 += 32) {
+      const int e = e0 + lane, c = e < E ? scnt[e] : 0;
+      const uint32_t bal = __ballot_sync(0xffffffffu, c > 0);
+      if (c > 0) {
+        const int pos = n + __popc(bal & ((1u << lane) - 1));
+        slot_e[pos] = e;
+        slot_m[pos] = c;
+        scnt[e] = pos;
+      }
+      n += __popc(bal);
+    }
+    __syncwarp();
+    for (int s = lane; s < n; s += 32) {
+      sgs13[s] = A.gs13[slot_e[s]] * 9.223372036854775808e18f;
+      sgs2[s] = A.gs2[slot_e[s]] * 9.223372036854775808e18f;
+    }
+    if (lane == 0) {
+      int r0 = 0, mmax = 1;
+      for (int s = 0; s < n; s++) {
+        slot_r0[s] = r0;
+        r0 += slot_m[s];
+        mmax = max(mmax, slot_m[s]);
+      }
+      misc[0] = n;
+      misc[1] = 0;
+      // shared memory past the x rows: the ring, then the intermediate rows
+      const int rowi = 2 * A.I + 16;
+      const int oring = (A.off_x + A.T * (2 * A.H + 16) + 1023) / 1024 * 1024;
+      const int avail = A.smem - oring;
+      int ns = min(A.nsmax, (avail - r0 * rowi) / D3_STB), nb = 0;
+      if (ns < 2 || n > D3_NBMAX) {  // rotate: as many buffers of mmax rows as leave two stages
+        nb = min(D3_NBMAX, (avail - 2 * D3_STB) / (mmax * rowi));
+        ns = min(A.nsmax, (avail - nb * mmax * rowi) / D3_STB);
+      }
+      misc[2] = ns;
+      misc[3] = nb;
+      misc[4] = oring;
+      misc[5] = oring + ns * D3_STB;
+      misc[6] = mmax;
+      // GEMM1 item size: halves when that lowers this grid's most GEMM1 stages per CTA
+      const int k1 = (A.C1 + A.nc1 - 1) / A.nc1, k1h = (A.C1 + A.nc1h - 1) / A.nc1h;
+      const int N1 = n * A.RB1 * 4;
+      const int full = (N1 + G - 1) / G * k1, half = (2 * N1 + G - 1) / G * k1h;
+      misc[7] = A.g1h == 1 ? 0 : A.g1h == 2 ? 1 : (half < full ? 1 : 0);
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < R; i += D3_THREADS) {
+    const int e = sids[i];
+    if ((unsigned)e < (unsigned)E) {
+      int rank = 0;
+      for (int j = 0; j < i; j++)
+        rank += sids[j] == e;
+      routes[slot_r0[scnt[e]] + rank] = i;
+    }
+  }
+  __syncthreads();
+  const int n = misc[0], NS = misc[2], NB = misc[3], mmax = misc[6], g1h = misc[7];
+  uint8_t* const ring = dsm + misc[4];
+  uint8_t* const rows = dsm + misc[5];
+  const int per1 = A.RB1 * (g1h ? 8 : 4);
+  const int N1 = n * per1, P2 = A.RB2 * 8;
+  const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0, n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0;
+  const int nc1 = g1h ? A.nc1h : A.nc1;
+  const int k1 = (A.C1 + nc1 - 1) / nc1, k2 = (A.C2 + A.nc2 - 1) / A.nc2;
+  const int nitems = n1c + n2c * n;
+  const int rowi = 2 * A.I + 16, rowx = 2 * A.H + 16;
+  // item it: GEMM1 (it < n1c; slot s, row block rb, part hp) or GEMM2 (piece (it - n1c) / n, slot (it - n1c) % n)
+  auto item = [&](int it, int& kind, int& s, int& rb, int& hp) {
+    if (it < n1c) {
+      const int i = b + it * G;
+      kind = 0, s = i / per1, rb = (i % per1) / (per1 / A.RB1), hp = i % (per1 / A.RB1);
+    } else {
+      const int j = b + ((it - n1c) / n) * G;
+      kind = 1, s = (it - n1c) % n, rb = j >> 3, hp = j & 7;
+    }
+  };
+  // GEMM2 item j2's row buffer: its slot's own rows (NB == 0) or buffer j2 % NB
+  auto rowbuf = [&](int j2, int s) { return NB == 0 ? rows + slot_r0[s] * rowi : rows + (j2 % NB) * mmax * rowi; };
+  if (A.trace && tid == 0) A.trace[b * 16 + 1] = gtime();
+
+  if (warp == D3_CW) {  // producer
+    if (lane == 0) {
+      const uint64_t pol = pol_evict_first();
+      const uint32_t rs = (uint32_t)__cvta_generic_to_shared(ring);
+      int k = 0;
+      for (int it = 0; it < nitems; it++) {
+        int kind, s, rb, hp;
+        item(it, kind, s, rb, hp);
+        const int e = slot_e[s];
+        const int ks = kind ? k2 : k1;
+        for (int j = 0; j < ks; j++, k++) {
+          const int st = k % NS;
+          if (k >= NS) mbar_wait(bempty + 8 * st, ((k / NS) + 1) & 1);
+          const uint32_t dst = rs + st * D3_STB, bar = bfull + 8 * st;
+          if (A.trace && k == 0) A.trace[b * 16 + 2] = gtime();
+          if (kind == 0 && g1h) {  // hp: unit hp & 1 of gate group 4 (hp >> 2) + ((hp >> 1) & 1) and of its up group
+            const int h = hp >> 2, p = (hp >> 1) & 1, u = hp & 1, row = e * A.RB1 + rb;
+            mbar_expect(bar, 2 * 576 * nc1);
+            tma_4d_h(dst, &mp.w13h, 72 * u, 4 * h + p, j * nc1, row, bar, pol);
+            tma_4d_h(dst + 576 * nc1, &mp.w13h, 72 * u, 4 * h + 2 + p, j * nc1, row, bar, pol);
+          } else if (kind == 0) {
+            const int h = hp >> 1, p = hp & 1, row = e * A.RB1 + rb;
+            mbar_expect(bar, 2 * 1152 * nc1);
+            tma_4d_h(dst, &mp.w13, 0, 4 * h + p, j * nc1, row, bar, pol);
+            tma_4d_h(dst + 1152 * nc1, &mp.w13, 0, 4 * h + 2 + p, j * nc1, row, bar, pol);
+          } else {
+            mbar_expect(bar, 1152 * A.nc2);
+            tma_4d_h(dst, &mp.w2, 0, hp, j * A.nc2, e * A.RB2 + rb, bar, pol);
+          }
+        }
+      }
+    }
+  } else if (warp >= D3_CW + 2) {  // fetchers: pair fp takes tasks fp, fp + 2, ...
+    const int fw = warp - D3_CW - 2, fp = fw >> 1, wi = fw & 1;
+    const int per = A.I / 4;  // 16B loads (two tagged words) per row
+    const int ntask = n2c > 0 ? (NB == 0 ? n : n2c * n) : 0;
+    for (int t = fp; t < ntask; t += 2) {
+      const int s = t % n, m = slot_m[s], r0 = slot_r0[s];
+      const int buf = NB == 0 ? s : t % NB;
+      if (NB != 0 && t >= NB) mbar_wait(bie + 8 * buf, ((t / NB) + 1) & 1);
+      // own GEMM1 items of slots <= s
+      const int lim = (s + 1) * per1 - b;
+      const int need = lim <= 0 ? 0 : min(n1c, (lim + G - 1) / G);
+      if (lane == 0) {
+        while (*reinterpret_cast<volatile int*>(misc + 1) < need)
+          __nanosleep(64);
+        if (A.fdly > 0) {
+          const uint64_t t0 = gtime();
+          while (gtime() - t0 < (uint64_t)A.fdly)
+            __nanosleep(64);
+        }
+        if (A.trace && wi == 0 && t < 3) A.trace[b * 16 + 8 + 2 * t] = gtime();
+      }
+      __syncwarp();
+      uint8_t* bb = rowbuf(t, s);
+      const int total = m * per;
+      auto src = [&](int i) {
+        return A.inter + (int64_t)routes[r0 + i / per] * (A.I / 2) + (i % per) * 2;
+      };
+      int rounds = 0;
+      for (int i0 = 0; i0 < total; i0 += 64 * D3_RL) {
+        uint4 v[D3_RL];
+        uint32_t pend = 0;
+#pragma unroll
+        for (int u = 0; u < D3_RL; u++) {
+          const int i = i0 + u * 64 + wi * 32 + lane;
+          if (i < total) {
+            v[u] = ld_relaxed_2u64(src(i));
+            pend |= 1u << u;
+          }
+        }
+        while (true) {
+          rounds++;
+#pragma unroll
+          for (int u = D3_RL - 1; u >= 0; u--) {
+            if (((pend >> u) & 1u) && ((v[u].y == ep && v[u].w == ep) || (A.dbg & 2))) {
+              const int i = i0 + u * 64 + wi * 32 + lane;
+              *reinterpret_cast<uint2*>(bb + (i / per) * rowi + (i % per) * 8) = make_uint2(v[u].x, v[u].z);
+              pend &= ~(1u << u);
+            }
+          }
+          if (!__any_sync(0xffffffffu, pend != 0)) break;
+#pragma unroll
+          for (int u = 0; u < D3_RL; u++)
+            if ((pend >> u) & 1u) v[u] = ld_relaxed_2u64(src(i0 + u * 64 + wi * 32 + lane));
+        }
+      }
+      __syncwarp();
+      if (lane == 0) {
+        if (A.trace && wi == 0 && t < 3) A.trace[b * 16 + 9 + 2 * t] = gtime();
+        if (A.trace && wi == 0 && t == 0) A.trace[b * 16 + 7] = rounds;
+        mbar_arrive(bif + 8 * buf);
+      }
+    }
+  } else if (warp == D3_CW + 1) {  // epilogue
+    float wsum[D3_TMAX];
+#pragma unroll
+    for (int t = 0; t < D3_TMAX; t++)
+      wsum[t] = 0.f;
+    for (int it = 0; it < nitems; it++) {
+      int kind, s, rb, hp;
+      item(it, kind, s, rb, hp);
+      const int hb = it & 1, m = slot_m[s], r0 = slot_r0[s];
+      mbar_wait(brf + 8 * hb, (it >> 1) & 1);
+      const float* red = redb + hb * (D3_RED / 4);
+      const int jr = lane;
+      if (kind == 0) {
+        const float sc = sgs13[s];
+        // full items: gate rows jr (32) at red rows jr, up at 32 + jr; half items: 16 gate rows at red rows jr, 16 up
+        // at 16 + jr (lanes 16 .. 31 idle)
+        const int h = g1h ? hp >> 2 : hp >> 1, p = g1h ? (hp >> 1) & 1 : hp & 1;
+        const int gi = g1h ? 16 * (hp & 1) + (jr & 15) : jr, uo = g1h ? 16 : 32;
+        const int col = 128 * rb + 64 * h + dec_kp(32 * p + gi);
+        for (int r = 0; r < m; r++) {
+          float gt = 0.f, ut = 0.f;
+#pragma unroll
+          for (int w = 0; w < D3_CW; w++)
+            gt += red[(w * 64 + (jr & (uo - 1))) * D3_TMAX + r], ut += red[(w * 64 + uo + (jr & (uo - 1))) * D3_TMAX + r];
+          gt *= sc;
+          // lanes 2c and 2c + 1 hold adjacent intermediate columns: one tagged word per pair
+          const uint32_t hv = __bfloat16_as_ushort(__float2bfloat16(gt / (1.f + __expf(-gt)) * (ut * sc)));
+          const uint32_t hn = __shfl_down_sync(0xffffffffu, hv, 1);
+          if (!(lane & 1) && jr < uo)
+            st_relaxed_u64(A.inter + (int64_t)routes[r0 + r] * (A.I / 2) + col / 2,
+                           ((unsigned long long)ep << 32) | (hv | (hn << 16)));
+        }
+        __syncwarp();
+        if (lane == 0) {
+          mbar_arrive(bre + 8 * hb);
+          *reinterpret_cast<volatile int*>(misc + 1) = it + 1;
+          if (A.trace) {
+            A.trace[b * 16 + 14] = gtime();
+            if (it == 0) A.trace[b * 16 + 15] = gtime();
+          }
+        }
+      } else {
+        const float sc = sgs2[s];
+        const int row0 = 256 * rb + 32 * hp;
+        for (int r = 0; r < m; r++) {
+          float v = 0.f;
+#pragma unroll
+          for (int w = 0; w < D3_CW; w++)
+            v += red[(w * 64 + jr) * D3_TMAX + r];
+          const int route = routes[r0 + r];
+          const __nv_bfloat16 yv = __float2bfloat16(v * sc);
+          if (A.tw == nullptr) {
+            A.y[(int64_t)route * A.H + row0 + jr] = yv;
+          } else {
+            const float c = stw[route] * __bfloat162float(yv);
+            const int t = route / A.topk;
+#pragma unroll
+            for (int tt = 0; tt < D3_TMAX; tt++)
+              if (tt == t) wsum[tt] += c;
+          }
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bre + 8 * hb);
+        if (s == n - 1) {
+          if (A.tw != nullptr) {
+#pragma unroll
+            for (int t = 0; t < D3_TMAX; t++) {
+              if (t < A.T) A.out[(int64_t)t * A.H + row0 + jr] = __float2bfloat16(wsum[t] * A.scale);
+              wsum[t] = 0.f;
+            }
+          } else {
+            for (int r = 0; r < R; r++)
+              if ((unsigned)sids[r] >= (unsigned)E) A.y[(int64_t)r * A.H + row0 + jr] = __float2bfloat16(0.f);
+          }
+        }
+      }
+    }
+    if (n == 0) {
+      for (int it = 0; it < n2c; it++) {
+        const int j = b + it * G, row0 = 256 * (j >> 3) + 32 * (j & 7);
+        const int nr = A.tw != nullptr ? A.T : R;
+        __nv_bfloat16* dst = A.tw != nullptr ? A.out : A.y;
+        for (int r = 0; r < nr; r++)
+          dst[(int64_t)r * A.H + row0 + lane] = __float2bfloat16(0.f);
+      }
+    }
+  } else {  // consumers
+    const int g = lane >> 2, q = lane & 3;
+    int k = 0;
+    uint64_t wb_ = 0, wf_ = 0;
+    if (n1c > 0) mbar_wait(bx, 0);
+    for (int it = 0; it < nitems; it++) {
+      int kind, s, rb, hp;
+      item(it, kind, s, rb, hp);
+      const int m = slot_m[s], r0 = slot_r0[s], j2 = it - n1c;
+      const int C = kind ? A.C2 : A.C1, nc = kind ? A.nc2 : nc1;
+      const uint8_t* brow = nullptr;
+      if (kind == 0) {
+        if (g < m) brow = dsm + A.off_x + (routes[r0 + g] / A.topk) * rowx;
+      } else {
+        const uint64_t t0 = A.trace ? gtime() : 0;
+        if (NB == 0)
+          mbar_wait(bif + 8 * s, 0);
+        else
+          mbar_wait(bif + 8 * (j2 % NB), (j2 / NB) & 1);
+        if (A.trace) wb_ += gtime() - t0;
+        if (g < m) brow = rowbuf(j2, s) + g * rowi;
+      }
+      float acc[4][4];
+#pragma unroll
+      for (int u = 0; u < 4; u++)
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+          acc[u][i] = 0.f;
+      const int ks = kind ? k2 : k1;
+      for (int j = 0; j < ks; j++, k++) {
+        const int st = k % NS;
+        {
+          const uint64_t t0 = A.trace ? gtime() : 0;
+          mbar_wait(bfull + 8 * st, (k / NS) & 1);
+          if (A.trace) wf_ += gtime() - t0;
+        }
+        if (A.trace && tid == 0) A.trace[b * 16 + 3] = gtime();
+        const uint8_t* sb = ring + st * D3_STB;
+        const int nv = min(nc, C - j * nc);
+        if (A.dbg & 1) {
+        } else if (kind == 0 && g1h) {
+          const int uo[4] = {0, 576 * nc, 0, 0};
+          d3_stage<2>(acc, sb, uo, 576, nv, brow, j * nc, warp, lane);
+        } else if (kind == 0) {
+          const int uo[4] = {0, 576, 1152 * nc, 1152 * nc + 576};
+          d3_stage<4>(acc, sb, uo, 1152, nv, brow, j * nc, warp, lane);
+        } else {
+          const int uo[4] = {0, 576, 0, 0};
+          d3_stage<2>(acc, sb, uo, 1152, nv, brow, j * nc, warp, lane);
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bempty + 8 * st);
+      }
+      if (kind == 1 && NB != 0) {
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bie + 8 * (j2 % NB));
+      }
+      const int hb = it & 1;
+      if (it >= 2) mbar_wait(bre + 8 * hb, ((it >> 1) + 1) & 1);
+      float* red = redb + hb * (D3_RED / 4);
+      const int U = kind ? 2 : (g1h ? 2 : 4);
+#pragma unroll
+      for (int u = 0; u < 4; u++) {
+        if (u < U) {
+          float* rp = red + (warp * 64 + 16 * u + g) * D3_TMAX;
+          if (2 * q < m) rp[2 * q] = acc[u][0], rp[8 * D3_TMAX + 2 * q] = acc[u][2];
+          if (2 * q + 1 < m) rp[2 * q + 1] = acc[u][1], rp[8 * D3_TMAX + 2 * q + 1] = acc[u][3];
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(brf + 8 * hb);
+    }
+    if (A.trace && tid == 0) A.trace[b * 16 + 5] = wb_, A.trace[b * 16 + 6] = wf_;
+  }
+  __syncthreads();
+  if (A.trace && tid == 0) A.trace[b * 16 + 4] = gtime();
+  // The last CTA to finish advances the epoch (the next call's reads of it are ordered by the kernel boundary).
+  if (tid == 0) {
+    __threadfence();
+    if (atom_add_acq_rel(A.state, 1) == G - 1) {
+      A.state[1] = (int)ep;
+      A.state[0] = 0;
+    }
+  }
+}
+
+// cfg: bits 0-7 dbg, 8-11 ring stages cap (0: 5), 12-13 GEMM1 half items (0 auto, 1 off, 2 on), 16-31 fdly in 10ns
+// (0xffff: the default).
+inline void run_decode3(
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView w13,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView gs13,
+    tvm::ffi::TensorView gs2,
+    tvm::ffi::TensorView inter,
+    tvm::ffi::TensorView y,
+    tvm::ffi::TensorView state,
+    tvm::ffi::Optional<tvm::ffi::TensorView> topk_weights,
+    tvm::ffi::Optional<tvm::ffi::TensorView> out,
+    double scale,
+    int64_t ctas,
+    int64_t cfg,
+    int64_t trace) {
+  using namespace host;
+  auto T = SymbolicSize{"tokens"};
+  auto H = SymbolicSize{"hidden"};
+  auto K = SymbolicSize{"top_k"};
+  auto R = SymbolicSize{"routes"};
+  auto E = SymbolicSize{"local_experts"};
+  auto device = SymbolicDevice{};
+  TensorMatcher({T, H}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(x);
+  TensorMatcher({T, K}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs13);
+  TensorMatcher({E}).with_dtype<float>().with_device(device).verify(gs2);
+  TensorMatcher({R, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(y);
+  TensorMatcher({-1}).with_dtype<int64_t>().with_device(device).ensure_alignment(16).verify(inter);
+  TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(state);
+  const int64_t t = T.unwrap(), h = H.unwrap(), topk = K.unwrap(), r = R.unwrap(), e = E.unwrap();
+  RuntimeCheck(w13.dim() == 5, "nvfp4_w4a16_sm90: packed w13 must be 5-D");
+  const int64_t i = w13.size(1) * 128;
+  RuntimeCheck(r == t * topk, "nvfp4_w4a16_sm90: workspace rows ", r, " != tokens * top_k ", t * topk);
+  RuntimeCheck(t >= 1 && t <= D3_TMAX && r <= D3_RMAX, "nvfp4_w4a16_sm90 decode3: at most ", D3_TMAX, " tokens and ",
+               D3_RMAX, " routes");
+  RuntimeCheck(h >= 256 && h % 256 == 0, "nvfp4_w4a16_sm90: hidden size must be a multiple of 256, got ", h);
+  RuntimeCheck(i >= 128 && i % 128 == 0, "nvfp4_w4a16_sm90: intermediate size must be a multiple of 128, got ", i);
+  RuntimeCheck(e >= 1 && e <= D3_EMAX, "nvfp4_w4a16_sm90: 1 to 1024 local experts, got ", e);
+  const int RB1 = (int)(2 * i / 256), RB2 = (int)(h / 256), C1 = (int)(h / 64), C2 = (int)(i / 64);
+  TensorMatcher({e, RB1, C1, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w13);
+  TensorMatcher({e, RB2, C2, 16, 576}).with_dtype<uint8_t>().with_device(device).ensure_alignment(16).verify(w2);
+  RuntimeCheck(out.has_value() == topk_weights.has_value(), "nvfp4_w4a16_sm90: out and topk_weights go together");
+  if (out.has_value()) {
+    TensorMatcher({T, H}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(out.value());
+    TensorMatcher({T, K}).with_dtype<float>().with_device(device).verify(topk_weights.value());
+  }
+  const DLDevice dev = device.unwrap();
+  RuntimeCheck(runtime::get_sm_version(dev.device_id) == 90, "nvfp4_w4a16_sm90: needs an sm_90 (Hopper) GPU");
+  const int sms = (int)runtime::get_sm_count(dev.device_id);
+  RuntimeCheck(state.size(0) >= 2, "nvfp4_w4a16_sm90 decode3: state too small");
+  RuntimeCheck(inter.size(0) >= r * i / 2, "nvfp4_w4a16_sm90 decode3: tagged intermediate too small");
+  const int off_x = D3_FIXED;
+  const int64_t oring = (off_x + t * (2 * h + 16) + 1023) / 1024 * 1024;
+  // the rotating fallback needs two stages and two buffers of t rows
+  RuntimeCheck(oring + 2 * D3_STB + 2 * t * (2 * i + 16) <= D3_SMEM_MAX,
+               "nvfp4_w4a16_sm90 decode3: tokens x width too large for shared memory");
+  const int nc1 = std::min(16, C1), nc1h = std::min(32, C1), nc2 = std::min(32, C2);
+  auto wmap = [&](void* base, int C, int64_t blocks, int nc, int box0) {
+    return host::tma::make_map(
+        base,
+        CU_TENSOR_MAP_DATA_TYPE_UINT64,
+        {144, 8, (cuuint64_t)C, (cuuint64_t)blocks},
+        {1152, 9216, (cuuint64_t)C * 9216},
+        {(cuuint32_t)box0, 1, (cuuint32_t)nc, 1},
+        {.l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_256B});
+  };
+  D3Maps mp;
+  mp.w13 = wmap(w13.data_ptr(), C1, e * RB1, nc1, 144);
+  mp.w13h = wmap(w13.data_ptr(), C1, e * RB1, nc1h, 72);
+  mp.w2 = wmap(w2.data_ptr(), C2, e * RB2, nc2, 144);
+  D3Args A;
+  A.x = static_cast<const __nv_bfloat16*>(x.data_ptr());
+  A.ids = static_cast<const int*>(topk_ids.data_ptr());
+  A.tw = topk_weights.has_value() ? static_cast<const float*>(topk_weights.value().data_ptr()) : nullptr;
+  A.gs13 = static_cast<const float*>(gs13.data_ptr());
+  A.gs2 = static_cast<const float*>(gs2.data_ptr());
+  A.inter = static_cast<unsigned long long*>(inter.data_ptr());
+  A.y = static_cast<__nv_bfloat16*>(y.data_ptr());
+  A.out = out.has_value() ? static_cast<__nv_bfloat16*>(out.value().data_ptr()) : nullptr;
+  A.state = static_cast<int*>(state.data_ptr());
+  A.scale = (float)scale;
+  A.T = (int)t, A.topk = (int)topk, A.E = (int)e, A.H = (int)h, A.I = (int)i;
+  A.RB1 = RB1, A.RB2 = RB2, A.C1 = C1, A.C2 = C2, A.nc1 = nc1, A.nc1h = nc1h, A.nc2 = nc2;
+  A.off_x = off_x;
+  A.smem = D3_SMEM_MAX;
+  const int nscap = (int)((cfg >> 8) & 15);
+  A.nsmax = std::min(D3_NSMAX, nscap ? nscap : 5);
+  A.g1h = (int)((cfg >> 12) & 3);
+  const int fd = (int)((cfg >> 16) & 0xffff);
+  A.fdly = fd == 0xffff ? 1000 : 10 * fd;
+  A.dbg = (int)(cfg & 0xff);
+  A.trace = reinterpret_cast<unsigned long long*>(trace);
+  const int grid = ctas > 0 ? (int)std::min<int64_t>(ctas, sms) : sms;
+  runtime::set_max_dynamic_smem_per_device<dec3_k>(dev, D3_SMEM_MAX);
+  LaunchKernel(grid, D3_THREADS, dev, D3_SMEM_MAX).enable_cooperative(!(A.dbg & 16))(dec3_k, mp, A);
+}
+
 }  // namespace sglang::nvfp4_w4a16_sm90

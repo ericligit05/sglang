@@ -545,3 +545,73 @@ def test_decode_matches_grouped_kernel_and_refuses_too_many_tokens():
     x = torch.randn((17, H), device="cuda").bfloat16()
     with pytest.raises(Exception):
         nvfp4_w4a16_sm90_moe(x, _routing(17, topk, E, Eg), experts, variant="decode")
+
+
+# ---- decode path 3 (variant "decode3", not dispatched) ----
+
+
+def _dec3_cfg(g1h=0, ns=0):
+    import sglang.kernels.ops.moe.nvfp4_w4a16_sm90 as op
+
+    op._DECODE_DEBUG["cfg3"] = (0xFFFF << 16) | (g1h << 12) | (ns << 8)
+
+
+@pytest.mark.parametrize("g1h", [1, 2])
+@pytest.mark.parametrize("T", [1, 2, 3, 4])
+@pytest.mark.parametrize("shape", ["deepseek_ep8", "qwen3_30b", "qwen3_next_ep8", "eplb36"])
+def test_decode3_token_counts(shape, T, g1h):
+    """Every token count decode3 accepts, with 32 + 32 and with 16 + 16 row GEMM1 items. Fails on: a tagged word
+    written to the wrong intermediate column (the half items' column map), a fetch that takes a stale word, a slot's
+    rows read from another slot's shared-memory rows."""
+    _dec3_cfg(g1h)
+    try:
+        _check(shape, T, variant="decode3")
+    finally:
+        _dec3_cfg()
+
+
+@pytest.mark.parametrize("ns", [2, 3])
+def test_decode3_small_ring_and_rotating_buffers(ns):
+    """Two and three ring stages; at four tokens DeepSeek's 32 routes do not all fit, so slots rotate through
+    buffers. Fails on: a buffer refilled before every consumer warp has read it, a ring stage reused early."""
+    _dec3_cfg(0, ns)
+    try:
+        for T in (1, 4):
+            _check("deepseek_ep8", T, variant="decode3")
+    finally:
+        _dec3_cfg()
+
+
+@pytest.mark.parametrize("kind,remote", [("hot", "minus_one"), ("empty", "minus_one"), ("remote", "minus_one")])
+def test_decode3_routing_kinds(kind, remote):
+    """One expert taking most routes, empty experts, no local route at all. Fails on: a hang when no slot exists,
+    a slot with more than one route read with the wrong row stride."""
+    for T in (1, 4):
+        _check("deepseek_ep8", T, kind=kind, remote=remote, variant="decode3")
+
+
+def test_decode3_weighted_sum_repeat_and_graph():
+    """The weighted sum against the reference, then the call repeated eagerly and replayed from a CUDA graph with
+    new routings: every result must match the reference and the eager call bitwise. Fails on: an epoch that does not
+    advance (a later call takes the earlier call's words), per-route weights staged from the wrong route."""
+    H, I, E, Eg, topk = SHAPES["deepseek_ep8"]
+    ck, experts = _layer("deepseek_ep8")
+    for T in (1, 3):
+        x = torch.randn((T, H), device="cuda").bfloat16()
+        ids = _routing(T, topk, E, Eg, seed=5 + T)
+        w = torch.rand((T, topk), device="cuda")
+        out = torch.empty((T, H), dtype=torch.bfloat16, device="cuda")
+        nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, out=out, scale=2.5, variant="decode3")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, out=out, scale=2.5, variant="decode3")
+        for rep in range(4):
+            x.copy_(torch.randn((T, H), device="cuda").bfloat16())
+            ids.copy_(_routing(T, topk, E, Eg, kind=("skew", "hot")[rep % 2], seed=40 + rep))
+            graph.replay()
+            eager = nvfp4_w4a16_sm90_moe(x, ids, experts, topk_weights=w, scale=2.5, variant="decode3")
+            torch.cuda.synchronize()
+            ref, local = _reference(ck, x, ids, E)
+            ref_sum = (ref.view(T, topk, H) * (w * local.view(T, topk)).unsqueeze(-1)).sum(1) * 2.5
+            _assert_close(out, ref_sum, slice(None))
+            assert torch.equal(out, eager)

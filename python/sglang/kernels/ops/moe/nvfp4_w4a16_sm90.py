@@ -46,6 +46,7 @@ def _module(debug_delay_ns: int = 0) -> Module:
             ("run", "nvfp4_w4a16_sm90::run"),
             ("run_decode", "nvfp4_w4a16_sm90::run_decode"),
             ("run_decode2", "nvfp4_w4a16_sm90::run_decode2"),
+            ("run_decode3", "nvfp4_w4a16_sm90::run_decode3"),
         ],
         extra_cuda_cflags=[f"-DNVFP4_MOE_DEBUG_DELAY_NS={debug_delay_ns}"]
         if debug_delay_ns
@@ -70,6 +71,21 @@ def _decode_workspace(dev: torch.device, floats: int, words: int):
         )
         _decode_ws[key] = ws
     return ws[0], ws[1]
+
+
+_decode3_ws: dict = {}
+
+
+def _decode3_inter(dev: torch.device, words: int) -> torch.Tensor:
+    """decode3's tagged intermediate ([routes][I / 2] words of two BF16 values and the call's epoch), per device and
+    stream. Its words must persist across calls (the epoch tells this call's from earlier ones), so it only grows,
+    zeroed, and the old buffer stays alive for CUDA graphs captured with it."""
+    key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
+    ws = _decode3_ws.get(key)
+    if ws is None or ws[0].numel() < words:
+        ws = (torch.zeros(max(words, 1 << 20), dtype=torch.int64, device=dev), ws)
+        _decode3_ws[key] = ws
+    return ws[0]
 
 
 def _decode_sizes(T: int, R: int, E: int, H: int, I: int, sms: int):
@@ -101,6 +117,20 @@ def nvfp4_w4a16_sm90_moe(
     R = T * topk_ids.shape[1]
     E, I = experts.gs13.shape[0], experts.intermediate
     dev = x.device
+    if variant == "decode3":
+        _, state = _decode_workspace(dev, 0, 32)
+        inter = _decode3_inter(dev, R * I // 2)
+        if topk_weights is None:
+            y = out if out is not None else torch.empty((R, H), dtype=torch.bfloat16, device=dev)
+            combined = None
+        else:
+            y = torch.empty((R, H), dtype=torch.bfloat16, device=dev)
+            combined = out if out is not None else torch.empty((T, H), dtype=torch.bfloat16, device=dev)
+        _module(debug_delay_ns).run_decode3(
+            x, topk_ids, experts.w13, experts.w2, experts.gs13, experts.gs2, inter, y, state, topk_weights,
+            combined, float(scale), ctas, _DECODE_DEBUG.get("cfg3", 0xFFFF << 16), _DECODE_DEBUG.get("trace3", 0),
+        )
+        return y if combined is None else combined
     if variant == "decode2":
         _, state = _decode_workspace(dev, 0, 32 * (1 + min(E, R)))
         inter = torch.empty((R, I), dtype=torch.bfloat16, device=dev)
