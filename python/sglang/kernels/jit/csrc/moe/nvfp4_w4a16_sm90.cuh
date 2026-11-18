@@ -3066,6 +3066,7 @@ struct D3Args {
   unsigned long long* trace;  // DEBUG: per kernel and CTA 8 globaltimer stamps (null: off)
   const uint8_t* w2raw;       // the packed w2 (dec3b_k reads small pieces of it with 16B copies)
   int cpa;                    // dec3b_k: 16B copies (stages under 9KB) instead of tensor copies
+  int pf;                     // dec3b_k: bytes past its ring it prefetches into L2 at the start
 };
 __device__ __forceinline__ void d3_stamp(const D3Args& A, int kern, int slot) {
   if (A.trace == nullptr) return;
@@ -3125,6 +3126,18 @@ __device__ __forceinline__ int d3_route(const int* ids, int R, int E, int* rt) {
   }
   __syncthreads();
   return misc[0];
+}
+
+// The box of a 4-D tensor map at {c0, c1, c2, c3} into L2 only (no shared memory, no completion to wait for).
+__device__ __forceinline__ void tma_prefetch_4d(const CUtensorMap* map, int c0, int c1, int c2, int c3, uint64_t pol) {
+  asm volatile("cp.async.bulk.prefetch.tensor.4d.L2.global.tile.L2::cache_hint [%0, {%1, %2, %3, %4}], %5;" ::"l"(map),
+               "r"(c0), "r"(c1), "r"(c2), "r"(c3), "l"(pol)
+               : "memory");
+}
+__device__ __forceinline__ uint64_t pol_evict_last() {
+  uint64_t p;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+  return p;
 }
 
 // 16B global -> shared copy through the load path (L2 only), and an arrive on bar once this thread's earlier ones land.
@@ -3379,9 +3392,14 @@ __global__ void __launch_bounds__(D3_THREADS, 2) dec3b_k(const __grid_constant__
   const int nc = A.nc2, cs = 576 * uh, ks = (A.C2 + nc - 1) / nc, U = n2c * n;
   // F: warps per unit, the power of two that minimizes (units per group) x (chunks per warp); on ties the smallest,
   // since each unit also costs a fixed chain of shared-memory reads per warp
+  // With the ring reused (not one shot), a group's next unit is (8 / F) ks stages on, so (8 / F) ks <= NS keeps every
+  // wait within one phase of its stage (a group a full ring ahead would read a stale phase's parity as done).
+  const bool fits = A.cpa && U * ks <= NS && (n == 0 || slot_r0[n - 1] + slot_m[n - 1] <= rcap);  // one shot
   int F = 8;
   for (int f = 4; f >= 1; f >>= 1)
-    if ((U + 8 / f - 1) / (8 / f) * ((A.C2 + f - 1) / f) <= (U + 8 / F - 1) / (8 / F) * ((A.C2 + F - 1) / F)) F = f;
+    if ((fits || (8 / f) * ks <= NS) &&
+        (U + 8 / f - 1) / (8 / f) * ((A.C2 + f - 1) / f) <= (U + 8 / F - 1) / (8 / F) * ((A.C2 + F - 1) / F))
+      F = f;
   if (tid == 0) {
     int nw = 0, r0 = 0;
     wins[0] = 0;
@@ -3420,46 +3438,52 @@ __global__ void __launch_bounds__(D3_THREADS, 2) dec3b_k(const __grid_constant__
   if (tid == 0) d3_stamp(A, 1, 1);
   const int pc = cs / 16;  // 16B pieces per chunk
 
-  // One shot: with 16B copies and every stage of this CTA in the ring at once, every warp issues a share of the stages
-  // now and the consumers wait once on ball.
-  const bool shot = A.cpa && nw == 1 && U * ks <= NS;
-  if (shot) {
-    for (int k = warp; k < U * ks; k += D3_THREADS / 32) {
-      const int q = k / ks, j = k - q * ks, nv = min(nc, A.C2 - j * nc);
-      const uint8_t* src = A.w2raw + usrc[q] + (long long)j * nc * 9216;
-      const uint32_t dst = ring + k * A.stb;
-      if (!(A.dbg & 16))
-        for (int c = 0; c < nv; c++)
-          for (int o = lane; o < pc; o += 32)
-            cp_async16(dst + c * cs + o * 16, src + (long long)c * 9216 + o * 16);
-    }
-    cp_async_arrive(ball);
+  // 16B copies (small stages): every warp issues a share of the first NS stages now, a warp per stage (one warp
+  // issuing them all takes about 0.75us per stage). Later stages are issued by the warp that frees the slot when a
+  // unit has one warp (F == 1), else by the producer warp.
+  const bool multi = A.cpa && nw == 1, total_fit = U * ks <= NS, crefill = multi && F == 1;
+  if (A.trace && tid == 0) {  // DEBUG: the CTA's plan
+    unsigned long long* pl = A.trace + 2 * G * 8 + b * 64 + 56;
+    pl[0] = NS, pl[1] = multi + 2 * total_fit, pl[2] = F, pl[3] = U, pl[4] = ks, pl[5] = nw, pl[6] = A.cpa,
+    pl[7] = A.stb;
   }
-  if (warp == D3_CW && !shot) {  // producer: starts at once, the ring fills while dec3a_k streams
+  auto issue_cp = [&](int k) {  // stage k into its slot by this warp's 32 lanes, then their arrives
+    const int q = k / ks, j = k - q * ks, nv = min(nc, A.C2 - j * nc);
+    const uint8_t* src = A.w2raw + usrc[q] + (long long)j * nc * 9216;
+    const uint32_t dst = ring + (k % NS) * A.stb;
+    if (!(A.dbg & 16))
+      for (int c = 0; c < nv; c++)
+        for (int o = lane; o < pc; o += 32)
+          cp_async16(dst + c * cs + o * 16, src + (long long)c * 9216 + o * 16);
+    cp_async_arrive(bfull + 8 * (k % NS));
+  };
+  if (multi)
+    for (int k = warp; k < min(NS, U * ks); k += D3_THREADS / 32)
+      issue_cp(k);
+  if (warp == D3_CW && !crefill && !(multi && total_fit)) {  // producer for the stages not issued above
     const uint64_t pol = pol_evict_first();
-    int k = 0;
-    for (int q = 0; q < U; q++)
-      for (int j = 0; j < ks; j++, k++) {
-        const int st = k % NS, nv = min(nc, A.C2 - j * nc);
-        if (k >= NS) mbar_wait(bempty + 8 * st, ((k / NS) + 1) & 1);
-        const uint32_t dst = ring + st * A.stb;
-        if (A.cpa) {  // small pieces: 16B copies from every lane
-          const uint8_t* src = A.w2raw + usrc[q] + (long long)j * nc * 9216;
-          if (!(A.dbg & 16))
-            for (int c = 0; c < nv; c++)
-              for (int o = lane; o < pc; o += 32)
-                cp_async16(dst + c * cs + o * 16, src + (long long)c * 9216 + o * 16);
-          cp_async_arrive(bfull + 8 * st);
-        } else if (lane == 0) {
-          mbar_expect(bfull + 8 * st, cs * nc);
-          tma_4d_h(dst, &mp.w2, uc[q] & 255, uc[q] >> 8, j * nc, ue[q], bfull + 8 * st, pol);
-        }
+    // DEBUG (A.pf > 0): the stages past the ring, up to A.pf bytes, into L2 now (evict_last). Measured slower.
+    if (!A.cpa && lane == 0) {
+      const uint64_t keep = pol_evict_last();
+      for (int k = NS, left = A.pf; k < U * ks && left >= cs * nc; k++, left -= cs * nc) {
+        const int q = k / ks, j = k - q * ks;
+        tma_prefetch_4d(&mp.w2, uc[q] & 255, uc[q] >> 8, j * nc, ue[q], keep);
       }
+    }
+    for (int k = multi ? NS : 0; k < U * ks; k++) {
+      const int st = k % NS, q = k / ks, j = k - q * ks;
+      if (k >= NS) mbar_wait(bempty + 8 * st, ((k / NS) + 1) & 1);
+      if (A.cpa) {
+        issue_cp(k);
+      } else if (lane == 0) {
+        mbar_expect(bfull + 8 * st, cs * nc);
+        tma_4d_h(ring + st * A.stb, &mp.w2, uc[q] & 255, uc[q] >> 8, j * nc, ue[q], bfull + 8 * st, pol);
+      }
+    }
   } else if (warp < D3_CW) {  // consumers; they also load each window's intermediate rows once dec3a_k has finished
     const int g = lane >> 2, qd = lane & 3, gN = 8 / F, grp = warp / F, wg = warp % F;
     GDC_WAIT();
     if (tid == 0) d3_stamp(A, 1, 2);
-    if (shot) mbar_wait(ball, 0);
     for (int w = 0; w < nw && n2c > 0; w++) {
       if (w > 0) asm volatile("bar.sync 1, %0;" ::"n"(D3_CW * 32) : "memory");  // every warp is done with the last rows
       {
@@ -3494,12 +3518,16 @@ __global__ void __launch_bounds__(D3_THREADS, 2) dec3b_k(const __grid_constant__
           for (int i = 0; i < 4; i++)
             acc[a][i] = 0.f;
         for (int j = 0; j < ks; j++) {
-          const int k = q * ks + j, st = shot ? k : k % NS;
-          if (!shot) mbar_wait(bfull + 8 * st, (k / NS) & 1);
+          const int k = q * ks + j, st = k % NS;
+          mbar_wait(bfull + 8 * st, (k / NS) & 1);
           const int nv = min(nc, A.C2 - j * nc);
           if (!(A.dbg & 1)) d3_stage(acc, dsm + st * A.stb, 0, uh, cs, nv, brow, j * nc, wg, F, lane);
           __syncwarp();
-          if (lane == 0 && !shot) mbar_arrive(bempty + 8 * st);
+          if (crefill) {
+            if (k + NS < U * ks) issue_cp(k + NS);
+          } else if (lane == 0 && !(multi && total_fit)) {
+            mbar_arrive(bempty + 8 * st);
+          }
         }
         // this warp's share: rows 16 u + g (+ 8), routes 2 qd, 2 qd + 1 of the slot
         const float sc = usc[q];
@@ -3660,6 +3688,9 @@ inline void run_decode3(
   A.nc1a = nc1a, A.nc1b = nc1b, A.nc2 = nc2, A.uh1 = (int)((cfg >> 16) & 3), A.uh2 = uh2;
   A.w2raw = static_cast<const uint8_t*>(w2.data_ptr());
   A.cpa = stbb < 9216 || ((cfg >> 28) & 1);
+  // cfg bits 48-57: L2 prefetch in 4KB units, off by default (128KB and 512KB measured 1 to 12us slower on H100 at
+  // Muse and DeepSeek EP8, 1 token)
+  A.pf = (int)((cfg >> 48) & 1023) * 4096;
   A.dbg = (int)((cfg >> 20) & 255);
   A.trace = reinterpret_cast<unsigned long long*>(trace);
   runtime::init_per_device<D3Carveout>(dev, [] {
