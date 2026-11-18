@@ -3352,9 +3352,9 @@ __global__ void __launch_bounds__(D3_THREADS, 2) dec3b_k(const __grid_constant__
   const int n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0, n2max = (P2 + G - 1) / G, UM = n2max * R;
   const int W = A.tw != nullptr ? A.T : R;  // wacc columns: tokens (weighted sum) or routes (y per route)
   // weighted sum: per consumer warp [piece][T][32], plain adds; y per route: [piece][R][32], shared atomics
-  const int WS = n2max * W * 32, NWS = A.tw != nullptr ? D3_CW : 1;
+  const int WS = n2max * W * 32, NWS = A.tw != nullptr ? D3_THREADS / 32 : 1;
   float* wacc = reinterpret_cast<float*>(dsm + A.off_fixed);
-  long long* usrc = reinterpret_cast<long long*>(wacc + max(D3_CW * n2max * A.T, n2max * R) * 32);
+  long long* usrc = reinterpret_cast<long long*>(wacc + max(D3_THREADS / 32 * n2max * A.T, n2max * R) * 32);
   uint64_t* bars = reinterpret_cast<uint64_t*>(usrc + UM);
   int* rt = reinterpret_cast<int*>(bars + 2 * D3_NSMAX + 2);
   float* gsa = reinterpret_cast<float*>(rt + 5 * R + E + 4);  // per expert: gs2 x 2^63
@@ -3442,6 +3442,11 @@ __global__ void __launch_bounds__(D3_THREADS, 2) dec3b_k(const __grid_constant__
   // issuing them all takes about 0.75us per stage). Later stages are issued by the warp that frees the slot when a
   // unit has one warp (F == 1), else by the producer warp.
   const bool multi = A.cpa && nw == 1, total_fit = U * ks <= NS, crefill = multi && F == 1;
+  // With no producer warp needed (16B copies, one warp per unit), every warp of the CTA consumes, as long as a group's
+  // next unit stays within one ring of its last (the same rule as for F above, now with 11 groups).
+  const int NCW = (crefill || (multi && total_fit && F == 1)) && (total_fit || (D3_THREADS / 32) * ks <= NS)
+                      ? D3_THREADS / 32
+                      : D3_CW;
   if (A.trace && tid == 0) {  // DEBUG: the CTA's plan
     unsigned long long* pl = A.trace + 2 * G * 8 + b * 64 + 56;
     pl[0] = NS, pl[1] = multi + 2 * total_fit, pl[2] = F, pl[3] = U, pl[4] = ks, pl[5] = nw, pl[6] = A.cpa,
@@ -3480,31 +3485,32 @@ __global__ void __launch_bounds__(D3_THREADS, 2) dec3b_k(const __grid_constant__
         tma_4d_h(ring + st * A.stb, &mp.w2, uc[q] & 255, uc[q] >> 8, j * nc, ue[q], bfull + 8 * st, pol);
       }
     }
-  } else if (warp < D3_CW) {  // consumers; they also load each window's intermediate rows once dec3a_k has finished
-    const int g = lane >> 2, qd = lane & 3, gN = 8 / F, grp = warp / F, wg = warp % F;
+  }
+  if (warp < NCW) {  // consumers; they also load each window's intermediate rows once dec3a_k has finished
+    const int g = lane >> 2, qd = lane & 3, gN = NCW / F, grp = warp / F, wg = warp % F;
     GDC_WAIT();
     if (tid == 0) d3_stamp(A, 1, 2);
     for (int w = 0; w < nw && n2c > 0; w++) {
-      if (w > 0) asm volatile("bar.sync 1, %0;" ::"n"(D3_CW * 32) : "memory");  // every warp is done with the last rows
+      if (w > 0) asm volatile("bar.sync 1, %0;" ::"r"(NCW * 32) : "memory");  // every warp is done with the last rows
       {
         const int per = A.I / 8, wr0 = slot_r0[wins[w]];  // 16B per load
         constexpr int L = 4;
         const int nl = slot_r0[wins[w + 1] - 1] + slot_m[wins[w + 1] - 1] - wr0;
-        for (int i0 = 0; i0 < nl * per; i0 += D3_CW * 32 * L) {
+        for (int i0 = 0; i0 < nl * per; i0 += NCW * 32 * L) {
           uint4 v[L];
 #pragma unroll
           for (int u = 0; u < L; u++) {
-            const int i = min(i0 + u * D3_CW * 32 + tid, nl * per - 1);
+            const int i = min(i0 + u * NCW * 32 + tid, nl * per - 1);
             v[u] = ld_cg4(A.inter + (int64_t)routes[wr0 + i / per] * A.I + (i % per) * 8);
           }
 #pragma unroll
           for (int u = 0; u < L; u++) {
-            const int i = i0 + u * D3_CW * 32 + tid;
+            const int i = i0 + u * NCW * 32 + tid;
             if (i < nl * per) *reinterpret_cast<uint4*>(dsm + A.off_b + (i / per) * rowi + (i % per) * 16) = v[u];
           }
         }
       }
-      asm volatile("bar.sync 1, %0;" ::"n"(D3_CW * 32) : "memory");
+      asm volatile("bar.sync 1, %0;" ::"r"(NCW * 32) : "memory");
       if (tid == 0 && w == 0) d3_stamp(A, 1, 3);
       const int q0 = woff[w] + ((grp - woff[w] % gN) + gN) % gN;
       for (int q = q0; q < woff[w + 1]; q += gN) {
@@ -3553,10 +3559,10 @@ __global__ void __launch_bounds__(D3_THREADS, 2) dec3b_k(const __grid_constant__
         }
       }
     }
-    asm volatile("bar.sync 1, %0;" ::"n"(D3_CW * 32) : "memory");
+    asm volatile("bar.sync 1, %0;" ::"r"(NCW * 32) : "memory");
     if (tid == 0) d3_stamp(A, 1, 6);
     // each piece's rows of out, or of y for every route (zeros for other ranks' routes)
-    for (int i = tid; i < n2c * W * RR; i += D3_CW * 32) {
+    for (int i = tid; i < n2c * W * RR; i += NCW * 32) {
       const int pi = i / (W * RR), c = (i / RR) % W, jr = i % RR;
       const int j = b + pi * G, qq = j % ppb;
       const int row = 256 * (j / ppb) + 32 * (qq / (2 / uh)) + 16 * (qq % (2 / uh)) + jr;
@@ -3639,7 +3645,7 @@ inline void run_decode3(
   const int xrows = rnd(t * (2 * h + 16));
   const int n2max = (int)((h / 16 / uh2 + G - 1) / G);
   const int fixa = 2 * D3_CW * 64 * (int)t * 4 + bars_b + route_b;
-  const int fixb = (int)std::max<int64_t>(D3_CW * n2max * t, n2max * r) * 32 * 4 + (int)r * 4 + n2max * (int)r * (8 + 7 * 4) + (2 * D3_NSMAX + 2) * 8 + route_b +
+  const int fixb = (int)std::max<int64_t>(D3_THREADS / 32 * n2max * t, n2max * r) * 32 * 4 + (int)r * 4 + n2max * (int)r * (8 + 7 * 4) + (2 * D3_NSMAX + 2) * 8 + route_b +
                    2 * D3_RMAX * 4;
   int nsa = (int)(cfg & 255), nsb = (int)((cfg >> 8) & 255);
   if (nsa == 0) nsa = 2;
