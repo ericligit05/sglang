@@ -3058,7 +3058,8 @@ constexpr int D3_NBMAX = 16;
 constexpr int D3_NBAR = 2 * D3_NSMAX + 1 + 2 * D3_NBMAX + 4;
 constexpr int D3_RL = 8;  // 16B loads per fetcher lane per round
 constexpr int D3_CH = 64 * D3_RL;  // 16B loads per fetch task (a pair of warps)
-constexpr int D3_FIXED = ((2 * D3_RED + D3_NBAR * 8 + (9 * D3_RMAX + 3 * D3_EMAX + 16) * 4) + 1023) / 1024 * 1024;
+constexpr int D3_IMAX = 1024;  // items whose decoded (kind, slot, row block, part) a CTA keeps in shared memory
+constexpr int D3_FIXED = ((2 * D3_RED + D3_NBAR * 8 + (9 * D3_RMAX + 3 * D3_EMAX + 16 + D3_IMAX) * 4) + 1023) / 1024 * 1024;
 constexpr int D3_SMEM_MAX = 232448;
 
 struct D3Maps {
@@ -3152,6 +3153,7 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
   float* stw = sgs2 + D3_RMAX;  // per route (in route order)
   float* egs = stw + D3_RMAX;  // per expert: gs13, then gs2 at + D3_EMAX
   int* scnt = reinterpret_cast<int*>(egs + 2 * D3_EMAX);
+  int* itab = scnt + D3_EMAX + 16;  // items, decoded once (see item)
   int* misc = scnt + D3_EMAX;  // [0] slots, [1] own GEMM1 items written, [2] ring stages, [3] row buffers (0: per slot)
                                // [4] ring offset, [5] rows offset, [6] rows per buffer, [7] half GEMM1 items
   const uint32_t bar0 = (uint32_t)__cvta_generic_to_shared(bars);
@@ -3270,18 +3272,39 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
   const int n1c = N1 > b ? (N1 - 1 - b) / G + 1 : 0, n2c = P2 > b ? (P2 - 1 - b) / G + 1 : 0;
   const int nc1 = g1h ? A.nc1h : A.nc1;
   const int k1 = (A.C1 + nc1 - 1) / nc1, k2 = (A.C2 + A.nc2 - 1) / A.nc2;
-  const int nitems = n1c + n2c * n;
   const int rowi = 2 * A.I + 16, rowx = 2 * A.H + 16;
-  // GEMM2 items whose weights are one small block (k2 == 1) share ring stages: G2 consecutive slots of a piece
-  const int G2 = k2 == 1 && !(A.dbg & 8) ? max(1, min(8, D3_STB / (1152 * A.nc2))) : 1;  // (dbg 8: one block per stage)
-  // item it: GEMM1 (it < n1c; slot s, row block rb, part hp) or GEMM2 (piece (it - n1c) / n, slot (it - n1c) % n)
-  auto item = [&](int it, int& kind, int& s, int& rb, int& hp) {
+  // A GEMM2 item is G2 consecutive slots of one piece when a slot's weights are one small block (k2 == 1): their
+  // blocks share one ring stage and their partial sums one hand-off (GLM's 8 slots: 1 item per piece, not 8; each
+  // item costs about 1us of hand-offs). The hand-off holds 8 routes, so G2 * (most routes of a slot) <= 8.
+  const int G2 = k2 == 1 && NB == 0 && !(A.dbg & 8) ? max(1, min(min(8, D3_STB / (1152 * A.nc2)), 8 / mmax)) : 1;
+  const int nG = (n + G2 - 1) / G2;
+  const int nitems = n1c + n2c * nG;
+  // item it: GEMM1 (it < n1c; slot s, row block rb, part hp) or GEMM2 (piece (it - n1c) / nG, slots [s, s + gsz)).
+  // Every role decodes every item, so the divisions run once per item here, in parallel, and the roles read a packed
+  // word (kind << 31 | slot << 20 | row block << 6 | (gsz - 1) << 3 | part).
+  auto item_dec = [&](int it, int& kind, int& s, int& rb, int& hp, int& gsz) {
     if (it < n1c) {
       const int i = b + it * G;
-      kind = 0, s = i / per1, rb = (i % per1) / (per1 / A.RB1), hp = i % (per1 / A.RB1);
+      kind = 0, s = i / per1, rb = (i % per1) / (per1 / A.RB1), hp = i % (per1 / A.RB1), gsz = 1;
     } else {
-      const int j = b + ((it - n1c) / n) * G;
-      kind = 1, s = (it - n1c) % n, rb = j >> 3, hp = j & 7;
+      const int j = b + ((it - n1c) / nG) * G;
+      kind = 1, s = ((it - n1c) % nG) * G2, rb = j >> 3, hp = j & 7, gsz = min(G2, n - s);
+    }
+  };
+  for (int it = tid; it < min(nitems, D3_IMAX); it += D3_THREADS) {
+    int kind, s, rb, hp, gsz;
+    item_dec(it, kind, s, rb, hp, gsz);
+    itab[it] = (int)(((uint32_t)kind << 31) | ((uint32_t)s << 20) | ((uint32_t)rb << 6) | ((uint32_t)(gsz - 1) << 3) |
+                     (uint32_t)hp);
+  }
+  __syncthreads();
+  auto item = [&](int it, int& kind, int& s, int& rb, int& hp, int& gsz) {
+    if (it < D3_IMAX) {
+      const uint32_t w = (uint32_t)itab[it];
+      kind = (int)(w >> 31), s = (int)((w >> 20) & 0x7ff), rb = (int)((w >> 6) & 0x3fff);
+      gsz = (int)((w >> 3) & 7) + 1, hp = (int)(w & 7);
+    } else {
+      item_dec(it, kind, s, rb, hp, gsz);
     }
   };
   // GEMM2 item j2's row buffer: its slot's own rows (NB == 0) or buffer j2 % NB
@@ -3294,11 +3317,10 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
       const uint32_t rs = (uint32_t)__cvta_generic_to_shared(ring);
       int k = 0;
       for (int it = 0; it < nitems; it++) {
-        int kind, s, rb, hp;
-        item(it, kind, s, rb, hp);
+        int kind, s, rb, hp, gsz;
+        item(it, kind, s, rb, hp, gsz);
         const int e = slot_e[s];
         const int ks = kind ? k2 : k1;
-        if (kind == 1 && s % G2 != 0) continue;  // issued with its group's first slot
         for (int j = 0; j < ks; j++, k++) {
           const int st = k % NS;
           if (k >= NS) mbar_wait_h(bempty + 8 * st, ((k / NS) + 1) & 1, A.whint);
@@ -3315,7 +3337,6 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
             tma_4d_h(dst, &mp.w13, 0, 4 * h + p, j * nc1, row, bar, pol);
             tma_4d_h(dst + 1152 * nc1, &mp.w13, 0, 4 * h + 2 + p, j * nc1, row, bar, pol);
           } else {
-            const int gsz = min(G2, n - s);
             mbar_expect(bar, gsz * 1152 * A.nc2);
             for (int u = 0; u < gsz; u++)
               tma_4d_h(dst + u * 1152 * A.nc2, &mp.w2, 0, hp, j * A.nc2, slot_e[s + u] * A.RB2 + rb, bar, pol);
@@ -3467,8 +3488,8 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     for (int t = 0; t < D3_TMAX; t++)
       wsum[t] = 0.f;
     for (int it = 0; it < nitems; it++) {
-      int kind, s, rb, hp;
-      item(it, kind, s, rb, hp);
+      int kind, s, rb, hp, gsz;
+      item(it, kind, s, rb, hp, gsz);
       const int hb = it & 1, m = slot_m[s], r0 = slot_r0[s];
       mbar_wait_h(brf + 8 * hb, (it >> 1) & 1, A.whint);
       const float* red = redb + hb * (D3_RED / 4);
@@ -3503,29 +3524,34 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
           }
         }
       } else {
-        const float sc = sgs2[s];
+        // the group's partial sums: [warp][32 rows][8 routes], the group's routes in slot order
         const int row0 = 256 * rb + 32 * hp;
-        for (int r = 0; r < m; r++) {
-          float v = 0.f;
+        int cum = 0;
+        for (int sub = 0; sub < gsz; sub++) {
+          const int ss = s + sub, ms = slot_m[ss], rs = slot_r0[ss];
+          const float sc = sgs2[ss];
+          for (int r = 0; r < ms; r++) {
+            float v = 0.f;
 #pragma unroll
-          for (int w = 0; w < D3_CW; w++)
-            v += red[(w * 64 + jr) * D3_TMAX + r];
-          const int route = routes[r0 + r];
-          const __nv_bfloat16 yv = __float2bfloat16(v * sc);
-          if (A.tw == nullptr) {
-            A.y[(int64_t)route * A.H + row0 + jr] = yv;
-          } else {
-            const float c = stw[route] * __bfloat162float(yv);
-            const int t = route / A.topk;
+            for (int w = 0; w < D3_CW; w++)
+              v += red[(w * 32 + jr) * 8 + cum + r];
+            const int route = routes[rs + r];
+            const __nv_bfloat16 yv = __float2bfloat16(v * sc);
+            if (A.tw == nullptr) {
+              A.y[(int64_t)route * A.H + row0 + jr] = yv;
+            } else {
+              const float c = stw[route] * __bfloat162float(yv);
+              const int t = route / A.topk;
 #pragma unroll
-            for (int tt = 0; tt < D3_TMAX; tt++)
-              if (tt == t) wsum[tt] += c;
+              for (int tt = 0; tt < D3_TMAX; tt++)
+                if (tt == t) wsum[tt] += c;
+            }
           }
+          cum += ms;
         }
         __syncwarp();
         if (lane == 0) mbar_arrive(bre + 8 * hb);
-        if (TRP && (A.dbg & 128) && lane == 0 && it - n1c < 8) TRP[b * D3_TRW + 24 + it - n1c] = gtime();
-        if (s == n - 1) {
+        if (s + gsz == n) {  // the piece's last group: its rows of out (or the zeros of other ranks' routes in y)
           if (A.tw != nullptr) {
 #pragma unroll
             for (int t = 0; t < D3_TMAX; t++) {
@@ -3554,70 +3580,98 @@ __global__ void __launch_bounds__(D3_THREADS, 1) dec3_k(const __grid_constant__ 
     uint64_t wb_ = 0, wf_ = 0;
     if (n1c > 0) mbar_wait_h(bx, 0, A.whint);
     for (int it = 0; it < nitems; it++) {
-      int kind, s, rb, hp;
-      item(it, kind, s, rb, hp);
-      const int m = slot_m[s], r0 = slot_r0[s], j2 = it - n1c;
-      const int C = kind ? A.C2 : A.C1, nc = kind ? A.nc2 : nc1;
-      const uint8_t* brow = nullptr;
-      if (kind == 0) {
-        if (g < m) brow = dsm + A.off_x + (routes[r0 + g] / A.topk) * rowx;
-      } else {
-        const uint64_t t0 = TRP ? gtime() : 0;
-        if (NB == 0) {
-          const int per = A.I / 4;
-          for (int c = r0 * per / D3_CH; c <= ((r0 + m) * per - 1) / D3_CH; c++)
-            mbar_wait_h(bif + 8 * c, 0, A.whint);
-        } else
-          mbar_wait_h(bif + 8 * (j2 % NB), (j2 / NB) & 1, A.whint);
-        if (TRP) wb_ += gtime() - t0;
-        if (TRP && (A.dbg & 128) && tid == 0 && j2 < 8) TRP[b * D3_TRW + 32 + j2] = gtime();
-        if (g < m) brow = rowbuf(j2, s) + g * rowi;
-      }
+      int kind, s, rb, hp, gsz;
+      item(it, kind, s, rb, hp, gsz);
+      const int hb = it & 1;
       float acc[4][4];
+      if (kind == 1) {  // GEMM2: the group's slots one after another from one stage (or k2 stages when gsz is 1)
+        const int j2 = it - n1c;
+        if (it >= 2) mbar_wait_h(bre + 8 * hb, ((it >> 1) + 1) & 1, A.whint);
+        float* red = redb + hb * (D3_RED / 4);
+        int cum = 0;
+        for (int sub = 0; sub < gsz; sub++) {
+          const int ss = s + sub, ms = slot_m[ss], rs = slot_r0[ss];
+          const uint64_t t0 = TRP ? gtime() : 0;
+          if (NB == 0) {
+            const int per = A.I / 4;
+            for (int c = rs * per / D3_CH; c <= ((rs + ms) * per - 1) / D3_CH; c++)
+              mbar_wait_h(bif + 8 * c, 0, A.whint);
+          } else {
+            mbar_wait_h(bif + 8 * (j2 % NB), (j2 / NB) & 1, A.whint);
+          }
+          if (TRP) wb_ += gtime() - t0;
+          const uint8_t* brow = g < ms ? rowbuf(j2, ss) + g * rowi : nullptr;
+#pragma unroll
+          for (int u = 0; u < 4; u++)
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+              acc[u][i] = 0.f;
+          for (int j = 0; j < k2; j++) {
+            const int st = k % NS;
+            if (sub == 0) {
+              const uint64_t t1 = TRP ? gtime() : 0;
+              mbar_wait_h(bfull + 8 * st, (k / NS) & 1, A.whint);
+              if (TRP) wf_ += gtime() - t1;
+            }
+            if (TRP && tid == 0) TRP[b * D3_TRW + 3] = gtime();
+            const int nv = min(A.nc2, A.C2 - j * A.nc2);
+            const int uo[4] = {0, 576, 0, 0};
+            if (!(A.dbg & 1))
+              d3_stage<2>(acc, ring + st * D3_STB + sub * 1152 * A.nc2, uo, 1152, nv, brow, j * A.nc2, warp, lane);
+            if (sub == gsz - 1) {
+              __syncwarp();
+              if (lane == 0) mbar_arrive(bempty + 8 * st);
+              k++;
+            }
+          }
+          if (NB != 0) {
+            __syncwarp();
+            if (lane == 0) mbar_arrive(bie + 8 * (j2 % NB));
+          }
+#pragma unroll
+          for (int u = 0; u < 2; u++) {
+            float* rp = red + (warp * 32 + 16 * u + g) * 8 + cum;
+            if (2 * q < ms) rp[2 * q] = acc[u][0], rp[64 + 2 * q] = acc[u][2];
+            if (2 * q + 1 < ms) rp[2 * q + 1] = acc[u][1], rp[64 + 2 * q + 1] = acc[u][3];
+          }
+          cum += ms;
+        }
+        __syncwarp();
+        if (lane == 0) mbar_arrive(brf + 8 * hb);
+        continue;
+      }
+      // GEMM1
+      const int m = slot_m[s], r0 = slot_r0[s];
+      const uint8_t* brow = g < m ? dsm + A.off_x + (routes[r0 + g] / A.topk) * rowx : nullptr;
 #pragma unroll
       for (int u = 0; u < 4; u++)
 #pragma unroll
         for (int i = 0; i < 4; i++)
           acc[u][i] = 0.f;
-      const int ks = kind ? k2 : k1;
-      const int sub = kind == 1 ? s % G2 : 0;
-      const bool glast = kind == 0 || sub == G2 - 1 || s == n - 1;
-      for (int j = 0; j < ks; j++) {
+      for (int j = 0; j < k1; j++, k++) {
         const int st = k % NS;
-        if (sub == 0) {
+        {
           const uint64_t t0 = TRP ? gtime() : 0;
           mbar_wait_h(bfull + 8 * st, (k / NS) & 1, A.whint);
           if (TRP) wf_ += gtime() - t0;
         }
         if (TRP && tid == 0) TRP[b * D3_TRW + 3] = gtime();
-        if (TRP && (A.dbg & 128) && tid == 0 && kind == 1 && j == 0 && j2 < 8) TRP[b * D3_TRW + 16 + j2] = gtime();
-        const uint8_t* sb = ring + st * D3_STB + sub * 1152 * A.nc2;
-        const int nv = min(nc, C - j * nc);
+        const uint8_t* sb = ring + st * D3_STB;
+        const int nv = min(nc1, A.C1 - j * nc1);
         if (A.dbg & 1) {
-        } else if (kind == 0 && g1h) {
-          const int uo[4] = {0, 576 * nc, 0, 0};
-          d3_stage<2>(acc, sb, uo, 576, nv, brow, j * nc, warp, lane);
-        } else if (kind == 0) {
-          const int uo[4] = {0, 576, 1152 * nc, 1152 * nc + 576};
-          d3_stage<4>(acc, sb, uo, 1152, nv, brow, j * nc, warp, lane);
+        } else if (g1h) {
+          const int uo[4] = {0, 576 * nc1, 0, 0};
+          d3_stage<2>(acc, sb, uo, 576, nv, brow, j * nc1, warp, lane);
         } else {
-          const int uo[4] = {0, 576, 0, 0};
-          d3_stage<2>(acc, sb, uo, 1152, nv, brow, j * nc, warp, lane);
+          const int uo[4] = {0, 576, 1152 * nc1, 1152 * nc1 + 576};
+          d3_stage<4>(acc, sb, uo, 1152, nv, brow, j * nc1, warp, lane);
         }
-        if (glast) {
-          __syncwarp();
-          if (lane == 0) mbar_arrive(bempty + 8 * st);
-          k++;
-        }
-      }
-      if (kind == 1 && NB != 0) {
         __syncwarp();
-        if (lane == 0) mbar_arrive(bie + 8 * (j2 % NB));
+        if (lane == 0) mbar_arrive(bempty + 8 * st);
       }
-      const int hb = it & 1;
       if (it >= 2) mbar_wait_h(bre + 8 * hb, ((it >> 1) + 1) & 1, A.whint);
       float* red = redb + hb * (D3_RED / 4);
-      const int U = kind ? 2 : (g1h ? 2 : 4);
+      const int U = g1h ? 2 : 4;
 #pragma unroll
       for (int u = 0; u < 4; u++) {
         if (u < U) {
