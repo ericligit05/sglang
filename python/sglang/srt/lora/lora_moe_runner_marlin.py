@@ -83,6 +83,12 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         M, K = hidden_states.shape
         E = quant_info.w13_qweight.shape[0]
         N = quant_info.w2_qweight.shape[1] * 16
+        # The LoRA hooks use the logical width, so a Marlin-padded N cannot use them.
+        if N != runner_config.intermediate_size_per_partition:
+            raise NotImplementedError(
+                "MoE LoRA on Marlin does not support a padded gated expert, got an "
+                f"intermediate size of {runner_config.intermediate_size_per_partition} per GPU"
+            )
         topk = topk_ids.shape[1]
         num_bits = quant_info.weight_bits
 

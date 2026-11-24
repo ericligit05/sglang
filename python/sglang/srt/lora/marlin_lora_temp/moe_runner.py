@@ -255,6 +255,12 @@ def fused_experts_experimental_sgl_marlin_lora(
     M, K = hidden_states.shape
     E = quant_info.w13_qweight.shape[0]
     N = quant_info.w2_qweight.shape[1] * 16
+    # The LoRA weights keep the logical width, so a Marlin-padded N cannot use them.
+    if lora_info.down_lora_a_weights.shape[3] != N:
+        raise NotImplementedError(
+            "MoE LoRA on Marlin does not support a padded gated expert, got an "
+            f"intermediate size of {lora_info.down_lora_a_weights.shape[3]} per GPU"
+        )
     topk = topk_ids.shape[1]
     num_bits = quant_info.weight_bits
     global_experts = runner_config.num_experts or E

@@ -453,5 +453,18 @@ def test_single_token_align_matches_general_path_with_invalid_ids():
         assert_aligned(got, ids, 16)
 
 
+def test_nvfp4_marlin_provider_refuses_padded_gated_layer():
+    # Marlin pads a gated 96-wide intermediate to 128, which the provider's
+    # one-slice padded buffer cannot hold, so it must refuse instead of overrunning.
+    _skip_unless_supported()
+    g = torch.Generator(device="cpu").manual_seed(11)
+    w13 = torch.randn(_E, 2 * 96, _H, generator=g).to(torch.bfloat16).cuda() * 0.05
+    w2 = torch.randn(_E, _H, 96, generator=g).to(torch.bfloat16).cuda() * 0.05
+    layer, _, _ = _fake_layer(w13, w2, gated=True)
+    quant_info = _marlin_quant_info(layer)
+    with pytest.raises(NotImplementedError, match="padded gated expert"):
+        select_provider_cls("route_major", "nvfp4", "marlin")(quant_info)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -45,6 +45,16 @@ class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
         self.quant_info = quant_info
         self._gate_up_slices = quant_info.gate_up_slices
         self._padded_intermediate_size = quant_info.w2_qweight.shape[1] * 16
+        # The padded buffer below holds one padded slice, so gated layers that
+        # Marlin padded are not supported.
+        if (
+            self._gate_up_slices > 1
+            and self._padded_intermediate_size != quant_info.intermediate_size
+        ):
+            raise NotImplementedError(
+                "MoE LoRA on Marlin does not support a padded gated expert, got an "
+                f"intermediate size of {quant_info.intermediate_size} per GPU"
+            )
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             get_scalar_type,
         )
