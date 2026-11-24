@@ -609,6 +609,98 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.5)
 
 
+@pytest.mark.skipif(
+    not (is_sm80_supported() or is_sm90_supported()),
+    reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
+)
+@pytest.mark.parametrize("intermediate_size", [80, 160, 256, 288])
+def test_fused_marlin_moe_nvfp4_gated_unaligned_intermediate(intermediate_size):
+    # Qwen3.8-Flash-Next at TP4 and TP8 gives 160 and 80 wide expert shards.
+    # Before gated padding, Marlin rejected 80, 160 and 288 with "Invalid thread
+    # config", and 256 needs no padding.
+    torch.manual_seed(0)
+
+    m = 33
+    hidden_size = 512
+    e = 4
+    topk = 2
+    dtype = torch.bfloat16
+
+    w13 = [
+        make_nvfp4_weight_and_ref(2 * intermediate_size, hidden_size, dtype)
+        for _ in range(e)
+    ]
+    w2 = [
+        make_nvfp4_weight_and_ref(hidden_size, intermediate_size, dtype)
+        for _ in range(e)
+    ]
+
+    layer = torch.nn.Module()
+    layer.quant_config = SimpleNamespace(group_size=16)
+    layer.moe_runner_config = SimpleNamespace(is_gated=True)
+    layer.params_dtype = dtype
+    layer.intermediate_size_per_partition = intermediate_size
+    for name, parts in (("w13", w13), ("w2", w2)):
+        for suffix, i in (("_weight", 0), ("_weight_scale", 1), ("_weight_scale_2", 2)):
+            param = torch.nn.Parameter(
+                torch.stack([p[i] for p in parts]), requires_grad=False
+            )
+            setattr(layer, name + suffix, param)
+    prepare_moe_nvfp4_layer_for_marlin(layer)
+
+    hidden_states = torch.randn((m, hidden_size), device="cuda", dtype=dtype) / 10
+    router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
+    topk_weights, topk_ids = torch.topk(
+        torch.softmax(router_logits, dim=-1, dtype=torch.float32), topk
+    )
+
+    def run():
+        return fused_marlin_moe(
+            hidden_states=hidden_states,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            gating_output=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1_global_scale=layer.w13_weight_scale_2,
+            w2_global_scale=layer.w2_weight_scale_2,
+            workspace=layer.workspace,
+            num_bits=4,
+            is_k_full=True,
+        )
+
+    output = run()
+
+    w13_ref = torch.stack([p[3] for p in w13]).float()
+    w2_ref = torch.stack([p[3] for p in w2]).float()
+    output_ref = torch.zeros((m, hidden_size), device="cuda", dtype=torch.float32)
+    for token_idx in range(m):
+        for route_idx in range(topk):
+            expert_id = topk_ids[token_idx, route_idx]
+            gate, up = (hidden_states[token_idx].float() @ w13_ref[expert_id].T).chunk(
+                2
+            )
+            routed = (torch.nn.functional.silu(gate) * up) @ w2_ref[expert_id].T
+            output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
+
+    # Outputs reach about 200, where a bf16 ulp is 1, so compare relative error.
+    # Aligned and padded widths both land near 0.9% against this fp32 reference.
+    def rel_err(out):
+        return ((out.float() - output_ref).norm() / output_ref.norm()).item()
+
+    torch.cuda.synchronize()
+    assert rel_err(output) < 0.02
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = run()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert rel_err(graph_output) < 0.02
+
+
 def _dequant_mxfp4_reference(packed, scales):
     fp4 = torch.tensor(
         [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
